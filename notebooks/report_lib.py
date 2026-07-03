@@ -113,6 +113,14 @@ def merge_activities_with_workspaces(
 
 def full_date_grid(dates: pd.Series) -> pd.DatetimeIndex:
     """Vrátí kompletní řadu dnů pokrývající data (pracovní dny Po-Pá, nebo všechny dny)."""
+    dates = dates.dropna()
+    if dates.empty:
+        raise ValueError(
+            "Nepodařilo se určit žádné platné datum aktivit po spojení s work_spaces.xlsx. "
+            "Nejčastější příčina: všechny řádky v bo_data.xlsx patří pobočkám (BRANCH_ID), "
+            "které nejsou ve work_spaces.xlsx — porovnejte BRANCH_ID v obou souborech "
+            "(viz proměnná `unknown_branches`)."
+        )
     start, end = dates.min(), dates.max()
     if BUSINESS_DAYS_ONLY:
         return pd.bdate_range(start, end)

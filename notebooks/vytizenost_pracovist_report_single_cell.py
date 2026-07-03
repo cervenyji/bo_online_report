@@ -244,6 +244,14 @@ def merge_activities_with_workspaces(activities, workspaces):
 
 def full_date_grid(dates):
     """Vrátí kompletní řadu dnů pokrývající data (pracovní dny Po-Pá, nebo všechny dny)."""
+    dates = dates.dropna()
+    if dates.empty:
+        raise ValueError(
+            "Nepodařilo se určit žádné platné datum aktivit po spojení s work_spaces.xlsx. "
+            "Nejčastější příčina: všechny řádky v bo_data.xlsx patří pobočkám (BRANCH_ID), "
+            "které nejsou ve work_spaces.xlsx — zkontrolujte hlášku 'Pozor: aktivity patří "
+            "pobočkám...' o pár buněk výš a porovnejte BRANCH_ID v obou souborech."
+        )
     start, end = dates.min(), dates.max()
     return pd.bdate_range(start, end) if BUSINESS_DAYS_ONLY else pd.date_range(start, end)
 
@@ -725,6 +733,14 @@ merged, unknown_branches = merge_activities_with_workspaces(activities, workspac
 if not unknown_branches.empty:
     print("Pozor: aktivity patří pobočkám, které nejsou ve work_spaces.xlsx:")
     display(unknown_branches[["BRANCH_ID", "WORKSTATION_ID", "DATETIME", "EMPLOYEE"]])
+
+if merged.empty:
+    print("BRANCH_ID v bo_data.xlsx:      ", sorted(activities["BRANCH_ID"].unique()))
+    print("BRANCH_ID v work_spaces.xlsx:  ", sorted(workspaces["BRANCH_ID"].unique()))
+    raise ValueError(
+        "Po spojení s work_spaces.xlsx nezůstala žádná platná aktivita (žádné BRANCH_ID se "
+        "neshoduje mezi bo_data.xlsx a work_spaces.xlsx) — viz vypsané seznamy ID výš."
+    )
 
 workstation_daily = compute_workstation_daily(merged)
 branch_daily = compute_branch_daily(merged)
