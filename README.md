@@ -7,14 +7,22 @@ denní kapacitě a vygeneruje samostatný interaktivní HTML report.
 
 ```
 notebooks/
-  vytizenost_pracovist_report.ipynb   hlavní notebook — spouštět odshora dolů
-  report_lib.py                       výpočty, grafy a sestavení HTML reportu
+  vytizenost_pracovist_report.ipynb          hlavní notebook — spouštět odshora dolů
+  report_lib.py                              výpočty, grafy a sestavení HTML reportu (import z notebooku)
+  vytizenost_pracovist_report_single_cell.py sám o sobě, ke zkopírování do jedné buňky vlastního notebooku
 data/
   sample/                             ukázkový vzorek dat (ze zadání) pro rychlý test
   README.md                           kam nahrát reálná data
 output/                               sem se ukládá vygenerovaný HTML report (do gitu se neverzuje)
 requirements.txt
 ```
+
+Dvě rovnocenné varianty stejného kódu:
+- **`vytizenost_pracovist_report.ipynb` + `report_lib.py`** — pro klonování celého repa a spouštění jako projekt.
+- **`vytizenost_pracovist_report_single_cell.py`** — celý kód v jednom souboru bez závislosti na `report_lib.py`;
+  stačí zkopírovat obsah do jedné buňky ve vlastním Jupyter notebooku. Navíc nepotřebuje `openpyxl` —
+  `.xlsx` soubory čte vlastní minimální čtečkou postavenou jen na standardní knihovně Pythonu
+  (`zipfile` + `xml.etree.ElementTree`), takže stačí mít `pandas`, `numpy` a `plotly`.
 
 ## Vstupní data
 
