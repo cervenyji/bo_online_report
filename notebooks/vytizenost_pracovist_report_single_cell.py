@@ -724,6 +724,9 @@ def build_html_report(
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
+SCRIPT_VERSION = "2026-07-03c (diagnostika NaT / neshoda BRANCH_ID)"
+print(f"Verze skriptu: {SCRIPT_VERSION}")
+
 activities, data_issues = load_activities(BO_DATA_FILE)
 workspaces = load_workspaces(WORKSPACES_FILE)
 print(f"Aktivity: {len(activities)} platných řádků, {len(data_issues)} přeskočeno (chybná data).")

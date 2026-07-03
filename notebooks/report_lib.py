@@ -18,6 +18,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 
+__version__ = "2026-07-03c (diagnostika NaT / neshoda BRANCH_ID)"
+
 # ---------------------------------------------------------------------------
 # Konfigurace
 # ---------------------------------------------------------------------------
