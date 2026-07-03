@@ -3,7 +3,7 @@
 #
 # Vstupy (v aktuálním adresáři, nebo uveďte plnou cestu níže v KONFIGURACI):
 #   bo_data.xlsx      : BRANCH_ID, PRACOVISTE_ID, DATETIME, ZAMESTNANEC, ACTIVITY, DURATION (minuty)
-#   work_spaces.xlsx  : BRANCH_ID, BRANCH_NAME, NO_WPL (počet pracovišť), CAPACITY (kapacita 1 pracoviště v hod/den)
+#   qr_codes_bo_online.xlsx    : BRANCH_ID, BRANCH_NAME, NO_WPL (počet pracovišť), CAPACITY (kapacita 1 pracoviště v hod/den)
 #
 # Výstup: samostatný HTML report (Plotly.js vložený přímo v souboru, funguje i offline).
 #
@@ -31,7 +31,7 @@ from IPython.display import IFrame, display
 # -----------------------------------------------------------------------------
 
 BO_DATA_FILE = "bo_data.xlsx"
-WORKSPACES_FILE = "work_spaces.xlsx"
+WORKSPACES_FILE = "qr_codes_bo_online.xlsx"
 OUTPUT_HTML = "vytizenost_report.html"
 
 BUSINESS_DAYS_ONLY = True  # pobočky mají provoz Po-Pá -> vytíženost se počítá jen pro pracovní dny
