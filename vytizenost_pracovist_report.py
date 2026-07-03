@@ -342,6 +342,26 @@ def summarize_branches(branch_daily, workspaces):
     return summary.sort_values("PRUMERNA_VYTIZENOST_PCT", ascending=False, na_position="last").reset_index(drop=True)
 
 
+def summarize_workstations(workstation_daily):
+    """Souhrn za celé sledované období pro každé jednotlivé pracoviště na pobočce —
+    aby šlo na jeden pohled vidět, které pracoviště je vytížené a které ne, a na kolik %."""
+    summary = (
+        workstation_daily.groupby(["BRANCH_ID", "BRANCH_NAME", "WORKSTATION_ID"])
+        .agg(
+            PRUMERNA_VYTIZENOST_PCT=("UTILIZATION_PCT", "mean"),
+            MAX_VYTIZENOST_PCT=("UTILIZATION_PCT", "max"),
+            DNI_KRITICKA=("BUCKET", lambda s: (s == "Kritická").sum()),
+            CELKEM_HODIN=("DURATION_MIN", lambda s: s.sum() / 60),
+            POCET_DNI=("DATE", "nunique"),
+        )
+        .reset_index()
+    )
+    summary["BUCKET"] = summary["PRUMERNA_VYTIZENOST_PCT"].apply(utilization_bucket)
+    return summary.sort_values(
+        ["BRANCH_ID", "PRUMERNA_VYTIZENOST_PCT"], ascending=[True, False]
+    ).reset_index(drop=True)
+
+
 def compute_capacity_growth_flags(merged, workspaces):
     """Poukazuje na pobočky, kde je v datech využíváno víc pracovišť, než je oficiálně
     registrováno ve work_spaces.xlsx (signál, že kapacitu pobočky je třeba navýšit v evidenci)."""
@@ -582,13 +602,30 @@ def build_html_report(
     activity_html = fig_html(fig_activity_mix(activity_breakdown)) if not activity_breakdown.empty else ""
     employee_html = fig_html(fig_employee_top(employee_summary)) if not employee_summary.empty else ""
 
+    workstation_summary = summarize_workstations(workstation_daily)
+
     heatmap_blocks = []
     for branch_id in sorted(workstation_daily["BRANCH_ID"].unique()):
         name = workstation_daily.loc[workstation_daily["BRANCH_ID"] == branch_id, "BRANCH_NAME"].iloc[0]
+
+        ws_table_html = _df_to_html_table(
+            workstation_summary.loc[workstation_summary["BRANCH_ID"] == branch_id].rename(columns={
+                "WORKSTATION_ID": "Pracoviště", "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
+                "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
+                "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
+            })[["Pracoviště", "Prům. vytíženost", "Max. vytíženost", "Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]],
+            bucket_col="Stav",
+            float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
+        )
+
         fig = fig_workstation_heatmap(workstation_daily, branch_id, name)
         heatmap_blocks.append(
             f'<details class="branch-block"><summary>{name} ({branch_id})</summary>'
-            f'<div style="padding:14px">{fig_html(fig)}</div></details>'
+            f'<div style="padding:14px">'
+            f'<h3>Vytíženost jednotlivých pracovišť (celé období)</h3>'
+            f'{ws_table_html}'
+            f'<div style="margin-top:18px">{fig_html(fig)}</div>'
+            f'</div></details>'
         )
     heatmaps_html = "\n".join(heatmap_blocks) if heatmap_blocks else "<p>Žádná data k dispozici.</p>"
 
@@ -676,7 +713,8 @@ def build_html_report(
 
   <div class="section">
     <h2>Vytíženost jednotlivých pracovišť</h2>
-    <p class="note">Rozklikněte pobočku pro zobrazení mapy vytíženosti jednotlivých pracovišť podle dne.</p>
+    <p class="note">Rozklikněte pobočku — uvidíte přehlednou tabulku všech jejích pracovišť
+    (vytížené / nevytížené a na kolik %) a pod ní i mapu vytíženosti podle jednotlivých dnů.</p>
     {heatmaps_html}
   </div>
 
@@ -724,7 +762,7 @@ def build_html_report(
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-03c (diagnostika NaT / neshoda BRANCH_ID)"
+SCRIPT_VERSION = "2026-07-03d (tabulka vytíženosti pracovišť po rozkliknutí pobočky)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
