@@ -32,13 +32,33 @@ from IPython.display import IFrame, display
 
 BO_DATA_FILE = "bo_data.xlsx"
 WORKSPACES_FILE = "qr_codes_bo_online.xlsx"
-OUTPUT_HTML = "vytizenost_report.html"
+OUTPUT_HTML = "vytizenost_report.html"  # ke jménu se při každém běhu přidá časové razítko (viz níže),
+                                         # aby prohlížeč/Jupyter nikdy nezobrazoval starou zkešovanou verzi souboru
 
 BUSINESS_DAYS_ONLY = True  # pobočky mají provoz Po-Pá -> vytíženost se počítá jen pro pracovní dny
 THRESHOLD_HIGH = 70.0      # od této hranice (%) je pracoviště "vysoce vytížené"
 THRESHOLD_CRITICAL = 90.0  # od této hranice (%) je pracoviště "kriticky vytížené" / na hraně kapacity
 
-BUCKET_COLORS = {"Nízká": "#2E7D32", "Vysoká": "#F9A825", "Kritická": "#C62828"}
+# --- Barevná paleta (validovaná: lightness/chroma/CVD/kontrast) --------------
+PAGE_BG = "#f9f9f7"
+SURFACE = "#fcfcfb"
+TEXT_PRIMARY = "#0b0b0b"
+TEXT_SECONDARY = "#52514e"
+TEXT_MUTED = "#898781"
+GRIDLINE = "#e1e0d9"
+BORDER = "rgba(11,11,11,0.10)"
+
+# Status (stav) — rezervováno, vždy s ikonou/popiskem, nikdy jako "5. kategorie"
+STATUS_GOOD = "#0ca30c"
+STATUS_WARNING = "#fab219"
+STATUS_CRITICAL = "#d03b3b"
+STATUS_MUTED = "#898781"
+
+BUCKET_COLORS = {"Nízká": STATUS_GOOD, "Vysoká": STATUS_WARNING, "Kritická": STATUS_CRITICAL, "Bez dat": STATUS_MUTED}
+
+# Kategoriální paleta (identita, pevné pořadí, nikdy necyklovat)
+CATEGORICAL = ["#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7", "#e34948", "#e87ba4", "#eb6834"]
+BLUE = CATEGORICAL[0]  # výchozí jednobarevná (sekvenční) barva pro grafy bez stavové sémantiky
 
 pd.set_option("display.max_columns", 50)
 pd.set_option("display.width", 140)
@@ -427,23 +447,43 @@ def detect_possible_overlaps(merged):
 # 5. Grafy (Plotly)
 # -----------------------------------------------------------------------------
 
+PLOTLY_FONT = dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color=TEXT_PRIMARY, size=13)
+
+
+def _style_chart(fig, legend=False):
+    """Sjednocený vzhled grafů: světlý povrch, jemné mřížky, tlumený text os,
+    žádný zbytečný legend box pro grafy s jednou sérií."""
+    fig.update_layout(
+        font=PLOTLY_FONT,
+        paper_bgcolor=SURFACE,
+        plot_bgcolor=SURFACE,
+        title_font=dict(size=15, color=TEXT_PRIMARY),
+        showlegend=legend,
+        margin=dict(l=10, r=10, t=50, b=40),
+    )
+    fig.update_xaxes(gridcolor=GRIDLINE, linecolor=GRIDLINE, tickfont=dict(color=TEXT_MUTED, size=11), title_font=dict(color=TEXT_SECONDARY))
+    fig.update_yaxes(gridcolor=GRIDLINE, linecolor=GRIDLINE, tickfont=dict(color=TEXT_MUTED, size=11), title_font=dict(color=TEXT_SECONDARY))
+    return fig
+
+
 def fig_branch_utilization_bar(branch_summary):
     df = branch_summary.dropna(subset=["PRUMERNA_VYTIZENOST_PCT"]).sort_values("PRUMERNA_VYTIZENOST_PCT")
-    colors = df["BUCKET"].map(BUCKET_COLORS).fillna("#9E9E9E")
+    colors = df["BUCKET"].map(BUCKET_COLORS).fillna(STATUS_MUTED)
     fig = go.Figure(go.Bar(
         x=df["PRUMERNA_VYTIZENOST_PCT"], y=df["BRANCH_NAME"] + " (" + df["BRANCH_ID"].astype(str) + ")",
-        orientation="h", marker_color=colors,
+        orientation="h", marker_color=colors, marker_line_width=0,
         text=df["PRUMERNA_VYTIZENOST_PCT"].round(1).astype(str) + " %", textposition="outside",
+        textfont=dict(color=TEXT_SECONDARY, size=11),
         hovertemplate="%{y}<br>Průměrná vytíženost: %{x:.1f} %<extra></extra>",
     ))
-    fig.add_vline(x=THRESHOLD_HIGH, line_dash="dot", line_color="#F9A825")
-    fig.add_vline(x=THRESHOLD_CRITICAL, line_dash="dot", line_color="#C62828")
-    fig.add_vline(x=100, line_color="#616161")
+    fig.add_vline(x=THRESHOLD_HIGH, line_dash="dot", line_color=STATUS_WARNING)
+    fig.add_vline(x=THRESHOLD_CRITICAL, line_dash="dot", line_color=STATUS_CRITICAL)
+    fig.add_vline(x=100, line_color=TEXT_MUTED)
     fig.update_layout(
         title="Průměrná denní vytíženost poboček vůči kapacitě", xaxis_title="Vytíženost (%)", yaxis_title=None,
-        height=max(320, 28 * len(df) + 120), margin=dict(l=10, r=10, t=60, b=40), template="plotly_white",
+        height=max(320, 28 * len(df) + 120), bargap=0.35,
     )
-    return fig
+    return _style_chart(fig)
 
 
 def fig_workstation_heatmap(workstation_daily, branch_id, branch_name):
@@ -454,15 +494,19 @@ def fig_workstation_heatmap(workstation_daily, branch_id, branch_name):
 
     fig = go.Figure(go.Heatmap(
         z=pivot.values, x=pivot.columns, y=[d.strftime("%d.%m.%Y") for d in pivot.index],
-        colorscale=[[0.0, "#2E7D32"], [THRESHOLD_HIGH / 150, "#F9A825"], [THRESHOLD_CRITICAL / 150, "#C62828"], [1.0, "#7B0000"]],
-        zmin=0, zmax=150, colorbar=dict(title="%"),
+        colorscale=[
+            [0.0, STATUS_GOOD], [THRESHOLD_HIGH / 150, STATUS_WARNING],
+            [THRESHOLD_CRITICAL / 150, STATUS_CRITICAL], [1.0, "#7a1414"],
+        ],
+        zmin=0, zmax=150, colorbar=dict(title="%", outlinewidth=0, tickfont=dict(color=TEXT_MUTED)),
         hovertemplate="%{x} | %{y}<br>Vytíženost: %{z:.1f} %<extra></extra>",
+        xgap=2, ygap=2,
     ))
     fig.update_layout(
         title=f"Denní vytíženost pracovišť — {branch_name} ({branch_id})",
-        height=max(260, 24 * len(pivot.index) + 120), margin=dict(l=10, r=10, t=60, b=40), template="plotly_white",
+        height=max(260, 24 * len(pivot.index) + 120),
     )
-    return fig
+    return _style_chart(fig)
 
 
 def fig_utilization_trend(branch_daily, top_n=8):
@@ -470,55 +514,66 @@ def fig_utilization_trend(branch_daily, top_n=8):
     d = branch_daily.loc[branch_daily["BRANCH_NAME"].isin(top_branches)]
     fig = px.line(
         d, x="DATE", y="UTILIZATION_PCT", color="BRANCH_NAME", markers=True,
+        color_discrete_sequence=CATEGORICAL,
         labels={"DATE": "Datum", "UTILIZATION_PCT": "Vytíženost (%)", "BRANCH_NAME": "Pobočka"},
         title=f"Trend vytíženosti v čase (top {top_n} poboček dle průměru)",
     )
-    fig.add_hline(y=THRESHOLD_CRITICAL, line_dash="dot", line_color="#C62828")
-    fig.update_layout(height=440, template="plotly_white", margin=dict(l=10, r=10, t=60, b=40))
-    return fig
+    fig.update_traces(line=dict(width=2), marker=dict(size=8, line=dict(width=2, color=SURFACE)))
+    fig.add_hline(y=THRESHOLD_CRITICAL, line_dash="dot", line_color=STATUS_CRITICAL)
+    fig.update_layout(height=440, legend_title_text="Pobočka")
+    return _style_chart(fig, legend=True)
 
 
 def fig_activity_mix(activity_breakdown):
-    fig = px.pie(activity_breakdown, names="ACTIVITY", values="CELKEM_HODIN", hole=0.45, title="Skladba aktivit dle odpracovaných hodin")
-    fig.update_traces(textinfo="percent+label", hovertemplate="%{label}<br>%{value:.1f} h (%{percent})<extra></extra>")
-    fig.update_layout(height=420, template="plotly_white", margin=dict(l=10, r=10, t=60, b=10))
-    return fig
+    fig = px.pie(
+        activity_breakdown, names="ACTIVITY", values="CELKEM_HODIN", hole=0.55,
+        color_discrete_sequence=CATEGORICAL, title="Skladba aktivit dle odpracovaných hodin",
+    )
+    fig.update_traces(
+        textinfo="percent", textfont=dict(color="white", size=12),
+        marker=dict(line=dict(color=SURFACE, width=2)),
+        hovertemplate="%{label}<br>%{value:.1f} h (%{percent})<extra></extra>",
+    )
+    fig.update_layout(height=380, legend_title_text="Aktivita")
+    return _style_chart(fig, legend=True)
 
 
 def fig_employee_top(employee_summary, n=15, title=None):
     d = employee_summary.sort_values("CELKEM_HODIN", ascending=False).head(n).sort_values("CELKEM_HODIN")
     label = d["EMPLOYEE"] + (" — " + d["BRANCH_NAME"] if "BRANCH_NAME" in d.columns and d["BRANCH_NAME"].nunique() > 1 else "")
     fig = go.Figure(go.Bar(
-        x=d["CELKEM_HODIN"], y=label, orientation="h", marker_color="#1565C0",
+        x=d["CELKEM_HODIN"], y=label, orientation="h", marker_color=BLUE, marker_line_width=0,
         text=d["CELKEM_HODIN"].round(1).astype(str) + " h", textposition="outside",
+        textfont=dict(color=TEXT_SECONDARY, size=11),
     ))
     fig.update_layout(
         title=title or f"Nejvytíženější zaměstnanci (top {n} dle odpracovaných hodin)",
         xaxis_title="Hodiny celkem", yaxis_title=None,
-        height=max(280, 26 * len(d) + 120), template="plotly_white", margin=dict(l=10, r=10, t=60, b=40),
+        height=max(280, 26 * len(d) + 120), bargap=0.35,
     )
-    return fig
+    return _style_chart(fig)
 
 
 def fig_branch_daily_bar(branch_daily, branch_id, branch_name):
     """Denní vytíženost JEDNÉ pobočky (sloupcový graf po dnech) — obdoba "Room Utilization Rate"."""
     d = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id].sort_values("DATE")
-    colors = d["BUCKET"].map(BUCKET_COLORS).fillna("#9E9E9E")
+    colors = d["BUCKET"].map(BUCKET_COLORS).fillna(STATUS_MUTED)
     fig = go.Figure(go.Bar(
         x=[dt.strftime("%d.%m.") for dt in d["DATE"]], y=d["UTILIZATION_PCT"],
-        marker_color=colors,
+        marker_color=colors, marker_line_width=0,
         text=d["UTILIZATION_PCT"].round(1).astype(str) + " %", textposition="outside",
+        textfont=dict(color=TEXT_SECONDARY, size=11),
         hovertemplate="%{x}<br>Vytíženost: %{y:.1f} %<extra></extra>",
     ))
-    fig.add_hline(y=THRESHOLD_HIGH, line_dash="dot", line_color="#F9A825")
-    fig.add_hline(y=THRESHOLD_CRITICAL, line_dash="dot", line_color="#C62828")
-    fig.add_hline(y=100, line_color="#616161")
+    fig.add_hline(y=THRESHOLD_HIGH, line_dash="dot", line_color=STATUS_WARNING)
+    fig.add_hline(y=THRESHOLD_CRITICAL, line_dash="dot", line_color=STATUS_CRITICAL)
+    fig.add_hline(y=100, line_color=TEXT_MUTED)
     fig.update_layout(
         title=f"Denní vytíženost pobočky vůči kapacitě — {branch_name}",
         xaxis_title=None, yaxis_title="Vytíženost (%)",
-        height=360, template="plotly_white", margin=dict(l=10, r=10, t=60, b=40),
+        height=360, bargap=0.35,
     )
-    return fig
+    return _style_chart(fig)
 
 
 def fig_activity_timeline(merged, branch_id, branch_name):
@@ -532,18 +587,19 @@ def fig_activity_timeline(merged, branch_id, branch_name):
 
     fig = px.timeline(
         d, x_start="DATETIME", x_end="END_DATETIME", y="WORKSTATION_LABEL",
-        color="ACTIVITY", hover_data={"EMPLOYEE": True, "DURATION_MIN": True, "WORKSTATION_LABEL": False},
+        color="ACTIVITY", color_discrete_sequence=CATEGORICAL,
+        hover_data={"EMPLOYEE": True, "DURATION_MIN": True, "WORKSTATION_LABEL": False},
         category_orders={"WORKSTATION_LABEL": order},
         title=f"Časová osa aktivit (kontrola překryvů) — {branch_name}",
     )
-    fig.update_traces(opacity=0.85, marker_line_width=0.5, marker_line_color="rgba(0,0,0,0.35)")
+    fig.update_traces(opacity=0.85, marker_line_width=1, marker_line_color=SURFACE)
     fig.update_yaxes(autorange="reversed", title=None)
     fig.update_xaxes(title="Čas", rangeslider_visible=True)
     fig.update_layout(
-        height=max(320, 42 * len(order) + 160), template="plotly_white",
-        margin=dict(l=10, r=10, t=60, b=40), legend_title_text="Aktivita",
+        height=max(320, 42 * len(order) + 160),
+        legend_title_text="Aktivita",
     )
-    return fig
+    return _style_chart(fig, legend=True)
 
 
 # -----------------------------------------------------------------------------
@@ -554,54 +610,70 @@ _CSS = """
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 body {
-    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-    background: #F4F6F8; color: #1A1A1A; margin: 0; padding: 0 0 60px 0;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #f9f9f7; color: #0b0b0b; margin: 0; padding: 0 0 60px 0; font-size: 14px;
 }
-.wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
-header.page { background: #0D2A4A; color: white; padding: 36px 0; margin-bottom: 28px; }
-header.page h1 { margin: 0 0 6px 0; font-size: 26px; }
-header.page p { margin: 0; opacity: 0.85; font-size: 14px; }
-h2 { font-size: 19px; border-bottom: 2px solid #E0E4E8; padding-bottom: 8px; margin-top: 44px; }
-h3 { font-size: 15px; color: #333; }
-.card-row { display: flex; gap: 16px; flex-wrap: wrap; margin: 16px 0 8px 0; }
+.wrap { max-width: 1220px; margin: 0 auto; padding: 0 24px; }
+header.page { padding: 22px 0 4px 0; }
+header.page .title-row { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+header.page h1 { margin: 0; font-size: 20px; font-weight: 700; color: #0b0b0b; }
+header.page p { margin: 2px 0 0 0; color: #898781; font-size: 12.5px; }
+h2 { font-size: 15px; font-weight: 700; color: #0b0b0b; border: none; padding-bottom: 0; margin: 0 0 14px 0; }
+h3 { font-size: 13.5px; font-weight: 700; color: #0b0b0b; margin: 18px 0 4px 0; }
+.card-row { display: flex; gap: 14px; flex-wrap: wrap; margin: 14px 0 4px 0; }
 .card {
-    background: white; border-radius: 10px; padding: 18px 22px; flex: 1 1 200px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-left: 4px solid #0D2A4A;
+    background: #fcfcfb; border-radius: 12px; padding: 16px 18px; flex: 1 1 180px;
+    box-shadow: 0 1px 2px rgba(11,11,11,0.05); border: 1px solid rgba(11,11,11,0.08);
+    position: relative; overflow: hidden; min-width: 0;
 }
-.card .label { font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: .04em; }
-.card .value { font-size: 26px; font-weight: 700; margin-top: 4px; }
-.section { background: white; border-radius: 10px; padding: 20px 24px; margin-top: 16px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-table.report { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 10px; }
-table.report th { background: #0D2A4A; color: white; text-align: left; padding: 8px 10px; position: sticky; top: 0; }
-table.report td { padding: 7px 10px; border-bottom: 1px solid #EEE; }
-table.report tr:nth-child(even) { background: #FAFBFC; }
-.badge { display: inline-block; padding: 2px 9px; border-radius: 12px; color: white; font-size: 12px; font-weight: 600; }
+.card .label { font-size: 11px; color: #898781; text-transform: uppercase; letter-spacing: .04em; display: flex; align-items: center; gap: 5px; }
+.card .value { font-size: 24px; font-weight: 600; margin-top: 5px; color: #0b0b0b; }
+.card .delta { font-size: 12px; font-weight: 600; margin-top: 3px; display: inline-flex; align-items: center; gap: 2px; }
+.card .delta.up { color: #006300; }
+.card .delta.down { color: #d03b3b; }
+.card .spark { position: absolute; right: 0; bottom: 0; opacity: 0.9; }
+.info-dot {
+    display: inline-flex; align-items: center; justify-content: center; width: 13px; height: 13px;
+    border-radius: 50%; border: 1px solid #c3c2b7; color: #898781; font-size: 9px; cursor: help;
+}
+.section { background: #fcfcfb; border-radius: 12px; padding: 20px 22px; margin-top: 16px;
+    box-shadow: 0 1px 2px rgba(11,11,11,0.05); border: 1px solid rgba(11,11,11,0.08); }
+table.report { border-collapse: collapse; width: 100%; font-size: 12.5px; margin-top: 10px; }
+table.report th {
+    background: transparent; color: #898781; text-align: left; padding: 8px 10px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .03em; font-weight: 600;
+    border-bottom: 1px solid #e1e0d9; position: sticky; top: 0; background-color: #fcfcfb;
+}
+table.report td { padding: 8px 10px; border-bottom: 1px solid #e1e0d9; color: #0b0b0b; }
+table.report tr:hover td { background: #f9f9f7; }
+.badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px 2px 6px; border-radius: 12px; font-size: 11.5px; font-weight: 600; color: #0b0b0b; background: #f0efec; }
+.badge .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
 .table-scroll { max-height: 480px; overflow-y: auto; }
-details.branch-block { margin-bottom: 14px; border: 1px solid #E0E4E8; border-radius: 8px; }
-details.branch-block summary { padding: 10px 14px; cursor: pointer; font-weight: 600; background: #F0F3F6; border-radius: 8px; }
-details.branch-block[open] summary { border-radius: 8px 8px 0 0; }
-.note { font-size: 12.5px; color: #666; margin-top: 6px; }
-footer { text-align: center; color: #888; font-size: 12px; margin-top: 50px; }
-.legend span { display: inline-flex; align-items: center; gap: 6px; margin-right: 18px; font-size: 12.5px; }
-.legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
-.branch-picker { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
-.branch-picker label { font-weight: 600; font-size: 14px; }
+details.branch-block { margin-bottom: 14px; border: 1px solid #e1e0d9; border-radius: 10px; }
+details.branch-block summary { padding: 10px 14px; cursor: pointer; font-weight: 600; background: #f9f9f7; border-radius: 10px; list-style: none; }
+details.branch-block summary::-webkit-details-marker { display: none; }
+details.branch-block[open] summary { border-radius: 10px 10px 0 0; }
+.note { font-size: 12px; color: #898781; margin-top: 6px; line-height: 1.5; }
+footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; margin-right: 18px; font-size: 12px; color: #52514e; }
+.legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.branch-picker { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 14px 0 18px 0; }
+.branch-picker label { font-weight: 600; font-size: 13px; color: #52514e; }
 .branch-picker select {
-    font-size: 15px; padding: 9px 14px; border-radius: 8px; border: 1px solid #C9D2DA;
-    background: white; min-width: 320px; cursor: pointer;
+    font-size: 14px; padding: 9px 14px; border-radius: 20px; border: 1px solid #c3c2b7;
+    background: #fcfcfb; min-width: 320px; cursor: pointer; color: #0b0b0b;
 }
 .branch-dash { display: none; }
 .branch-dash.active { display: block; }
 .branch-dash-header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }
-.branch-dash-header h2 { margin-top: 0; border: none; padding-bottom: 0; }
-.no-data-panel { padding: 40px 20px; text-align: center; color: #888; }
+.branch-dash-header h2 { font-size: 17px; margin-top: 0; }
+.no-data-panel { padding: 40px 20px; text-align: center; color: #898781; }
 """
 
 
 def _bucket_badge(bucket):
-    color = BUCKET_COLORS.get(bucket, "#9E9E9E")
-    return f'<span class="badge" style="background:{color}">{bucket}</span>'
+    color = BUCKET_COLORS.get(bucket, STATUS_MUTED)
+    return f'<span class="badge"><i class="dot" style="background:{color}"></i>{bucket}</span>'
 
 
 def _df_to_html_table(df, bucket_col=None, float_cols=None):
@@ -613,6 +685,57 @@ def _df_to_html_table(df, bucket_col=None, float_cols=None):
     if bucket_col and bucket_col in d.columns:
         d[bucket_col] = d[bucket_col].map(_bucket_badge)
     return d.to_html(index=False, escape=False, classes="report", border=0)
+
+
+def _sparkline_svg(values, color, width=110, height=32):
+    """Malý inline SVG sparkline (bez závislosti na Plotly) pro KPI dlaždice —
+    tenká 2px linie + jemná výplň ~12% pod čarou, poslední bod zvýrazněný."""
+    vals = [v for v in values if pd.notna(v)]
+    if len(vals) < 2:
+        return ""
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1.0
+    pad = 3
+    n = len(vals)
+    xs = [pad + i * (width - 2 * pad) / (n - 1) for i in range(n)]
+    ys = [height - pad - (v - lo) / span * (height - 2 * pad) for v in vals]
+    line_points = " ".join(f"{x:.1f},{y:.1f}" for x, y in zip(xs, ys))
+    area_points = f"{xs[0]:.1f},{height} " + line_points + f" {xs[-1]:.1f},{height}"
+    return f"""<svg class="spark" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+    <polyline points="{area_points}" fill="{color}" fill-opacity="0.12" stroke="none" />
+    <polyline points="{line_points}" fill="none" stroke="{color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
+    <circle cx="{xs[-1]:.1f}" cy="{ys[-1]:.1f}" r="3" fill="{color}" stroke="{SURFACE}" stroke-width="1.5" />
+    </svg>"""
+
+
+def _trend_delta_pct(values):
+    """Změna v % mezi první a druhou polovinou období — pohání šipku/barvu na KPI dlaždici."""
+    vals = [v for v in values if pd.notna(v)]
+    if len(vals) < 4:
+        return None
+    mid = len(vals) // 2
+    first_half, second_half = vals[:mid], vals[mid:]
+    first_avg = sum(first_half) / len(first_half)
+    second_avg = sum(second_half) / len(second_half)
+    if first_avg == 0:
+        return None
+    return (second_avg - first_avg) / first_avg * 100
+
+
+def _stat_tile(label, value, *, delta_pct=None, spark_values=None, spark_color=BLUE, tooltip=None):
+    info = f'<span class="info-dot" title="{tooltip}">?</span>' if tooltip else ""
+    delta_html = ""
+    if delta_pct is not None:
+        direction = "up" if delta_pct >= 0 else "down"
+        arrow = "▲" if delta_pct >= 0 else "▼"
+        delta_html = f'<div class="delta {direction}">{arrow} {abs(delta_pct):.1f} %</div>'
+    spark_html = _sparkline_svg(spark_values, spark_color) if spark_values is not None else ""
+    return f"""<div class="card">
+      <div class="label">{label}{info}</div>
+      <div class="value">{value}</div>
+      {delta_html}
+      {spark_html}
+    </div>"""
 
 
 def build_html_report(
@@ -629,20 +752,26 @@ def build_html_report(
     n_workstations_registered = int(workspaces["NO_WORKSTATIONS"].sum())
     n_employees = merged["EMPLOYEE"].nunique()
 
+    daily_all = branch_daily.groupby("DATE").agg(UTILIZATION_PCT=("UTILIZATION_PCT", "mean"), DURATION_MIN=("DURATION_MIN", "sum")).sort_index()
+    util_series = daily_all["UTILIZATION_PCT"].tolist()
+    hours_series = (daily_all["DURATION_MIN"] / 60).tolist()
+
     cards = f"""
     <div class="card-row">
-      <div class="card"><div class="label">Sledované období</div>
-        <div class="value" style="font-size:18px">{period_start:%d.%m.%Y} – {period_end:%d.%m.%Y}</div></div>
-      <div class="card"><div class="label">Průměrná vytíženost poboček</div>
-        <div class="value">{overall_util:.1f} %</div></div>
-      <div class="card"><div class="label">Odpracované hodiny celkem</div>
-        <div class="value">{total_hours:,.0f} h</div></div>
-      <div class="card"><div class="label">Pobočky s daty / celkem</div>
-        <div class="value">{n_branches_with_data} / {n_branches_total}</div></div>
-      <div class="card"><div class="label">Registrovaná pracoviště</div>
-        <div class="value">{n_workstations_registered}</div></div>
-      <div class="card"><div class="label">Aktivních zaměstnanců</div>
-        <div class="value">{n_employees}</div></div>
+      {_stat_tile("Sledované období", f'{period_start:%d.%m.%Y} – {period_end:%d.%m.%Y}')}
+      {_stat_tile(
+          "Průměrná vytíženost poboček", f"{overall_util:.1f} %",
+          delta_pct=_trend_delta_pct(util_series), spark_values=util_series, spark_color=BLUE,
+          tooltip="Průměr denní vytíženosti přes všechny pobočky s daty",
+      )}
+      {_stat_tile(
+          "Odpracované hodiny celkem", f"{total_hours:,.0f} h",
+          delta_pct=_trend_delta_pct(hours_series), spark_values=hours_series, spark_color=CATEGORICAL[1],
+          tooltip="Součet DURATION přes všechny aktivity ve sledovaném období",
+      )}
+      {_stat_tile("Pobočky s daty / celkem", f"{n_branches_with_data} / {n_branches_total}")}
+      {_stat_tile("Registrovaná pracoviště", f"{n_workstations_registered}")}
+      {_stat_tile("Aktivních zaměstnanců", f"{n_employees}")}
     </div>
     """
 
@@ -714,13 +843,27 @@ def build_html_report(
         b_used_ws = int(b_merged["WORKSTATION_ID"].nunique())
         b_registered_ws = int(row["NO_WORKSTATIONS"])
 
+        b_daily = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id].sort_values("DATE")
+        b_activities_series = b_daily["N_ACTIVITIES"].tolist()
+        b_hours_series = (b_daily["DURATION_MIN"] / 60).tolist()
+        b_util_series = b_daily["UTILIZATION_PCT"].tolist()
+
         kpi_html = f"""
         <div class="card-row">
-          <div class="card"><div class="label">Celkem aktivit</div><div class="value">{n_activities:,}</div></div>
-          <div class="card"><div class="label">Celkem hodin</div><div class="value">{b_hours:.1f} h</div></div>
-          <div class="card"><div class="label">Průměrná vytíženost</div><div class="value">{row['PRUMERNA_VYTIZENOST_PCT']:.1f} %</div></div>
-          <div class="card"><div class="label">Max. denní vytíženost</div><div class="value">{row['MAX_VYTIZENOST_PCT']:.1f} %</div></div>
-          <div class="card"><div class="label">Využitá / registrovaná pracoviště</div><div class="value">{b_used_ws} / {b_registered_ws}</div></div>
+          {_stat_tile(
+              "Celkem aktivit", f"{n_activities:,}",
+              delta_pct=_trend_delta_pct(b_activities_series), spark_values=b_activities_series, spark_color=BLUE,
+          )}
+          {_stat_tile(
+              "Celkem hodin", f"{b_hours:.1f} h",
+              delta_pct=_trend_delta_pct(b_hours_series), spark_values=b_hours_series, spark_color=CATEGORICAL[1],
+          )}
+          {_stat_tile(
+              "Průměrná vytíženost", f"{row['PRUMERNA_VYTIZENOST_PCT']:.1f} %",
+              delta_pct=_trend_delta_pct(b_util_series), spark_values=b_util_series, spark_color=CATEGORICAL[2],
+          )}
+          {_stat_tile("Max. denní vytíženost", f"{row['MAX_VYTIZENOST_PCT']:.1f} %")}
+          {_stat_tile("Využitá / registrovaná pracoviště", f"{b_used_ws} / {b_registered_ws}")}
         </div>
         """
 
@@ -734,7 +877,6 @@ def build_html_report(
             float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
         )
 
-        b_daily = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id]
         daily_bar_html = fig_html(fig_branch_daily_bar(branch_daily, branch_id, branch_name)) if b_daily["DATE"].nunique() > 1 else ""
         heatmap_html = fig_html(fig_workstation_heatmap(workstation_daily, branch_id, branch_name))
         timeline_html = fig_html(fig_activity_timeline(merged, branch_id, branch_name))
@@ -885,7 +1027,7 @@ def build_html_report(
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-03e (přepínač poboček, časová osa pro kontrolu překryvů)"
+SCRIPT_VERSION = "2026-07-08 (nový vizuální styl: KPI dlaždice se sparklines, validovaná paleta, lehčí grafy)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
@@ -927,14 +1069,18 @@ if branch_daily["DATE"].nunique() > 1:
 fig_activity_mix(activity_breakdown).show()
 fig_employee_top(employee_summary).show()
 
+_output_base = Path(OUTPUT_HTML)
+_output_timestamped = _output_base.with_name(f"{_output_base.stem}_{datetime.now():%Y%m%d_%H%M%S}{_output_base.suffix}")
+
 report_path = build_html_report(
-    OUTPUT_HTML,
+    _output_timestamped,
     period_start=branch_daily["DATE"].min(), period_end=branch_daily["DATE"].max(),
     activities=activities, workspaces=workspaces, merged=merged,
     branch_summary=branch_summary, branch_daily=branch_daily, workstation_daily=workstation_daily,
     growth_flags=growth_flags, activity_breakdown=activity_breakdown, employee_summary=employee_summary,
     overlaps=overlaps, data_issues=data_issues, unknown_branches=unknown_branches,
 )
-print(f"\nReport vygenerován: {report_path.resolve()}")
+print(f"\nReport vygenerován (nový soubor, jiný název než minule): {report_path.resolve()}")
+print("Otevřete tento konkrétní soubor v prohlížeči — NE starou záložku s předchozí verzí.")
 
 display(IFrame(src=str(report_path), width="100%", height=800))
