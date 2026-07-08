@@ -485,15 +485,63 @@ def fig_activity_mix(activity_breakdown):
     return fig
 
 
-def fig_employee_top(employee_summary, n=15):
+def fig_employee_top(employee_summary, n=15, title=None):
     d = employee_summary.sort_values("CELKEM_HODIN", ascending=False).head(n).sort_values("CELKEM_HODIN")
+    label = d["EMPLOYEE"] + (" — " + d["BRANCH_NAME"] if "BRANCH_NAME" in d.columns and d["BRANCH_NAME"].nunique() > 1 else "")
     fig = go.Figure(go.Bar(
-        x=d["CELKEM_HODIN"], y=d["EMPLOYEE"] + " — " + d["BRANCH_NAME"], orientation="h", marker_color="#1565C0",
+        x=d["CELKEM_HODIN"], y=label, orientation="h", marker_color="#1565C0",
         text=d["CELKEM_HODIN"].round(1).astype(str) + " h", textposition="outside",
     ))
     fig.update_layout(
-        title=f"Nejvytíženější zaměstnanci (top {n} dle odpracovaných hodin)", xaxis_title="Hodiny celkem", yaxis_title=None,
-        height=max(320, 26 * len(d) + 120), template="plotly_white", margin=dict(l=10, r=10, t=60, b=40),
+        title=title or f"Nejvytíženější zaměstnanci (top {n} dle odpracovaných hodin)",
+        xaxis_title="Hodiny celkem", yaxis_title=None,
+        height=max(280, 26 * len(d) + 120), template="plotly_white", margin=dict(l=10, r=10, t=60, b=40),
+    )
+    return fig
+
+
+def fig_branch_daily_bar(branch_daily, branch_id, branch_name):
+    """Denní vytíženost JEDNÉ pobočky (sloupcový graf po dnech) — obdoba "Room Utilization Rate"."""
+    d = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id].sort_values("DATE")
+    colors = d["BUCKET"].map(BUCKET_COLORS).fillna("#9E9E9E")
+    fig = go.Figure(go.Bar(
+        x=[dt.strftime("%d.%m.") for dt in d["DATE"]], y=d["UTILIZATION_PCT"],
+        marker_color=colors,
+        text=d["UTILIZATION_PCT"].round(1).astype(str) + " %", textposition="outside",
+        hovertemplate="%{x}<br>Vytíženost: %{y:.1f} %<extra></extra>",
+    ))
+    fig.add_hline(y=THRESHOLD_HIGH, line_dash="dot", line_color="#F9A825")
+    fig.add_hline(y=THRESHOLD_CRITICAL, line_dash="dot", line_color="#C62828")
+    fig.add_hline(y=100, line_color="#616161")
+    fig.update_layout(
+        title=f"Denní vytíženost pobočky vůči kapacitě — {branch_name}",
+        xaxis_title=None, yaxis_title="Vytíženost (%)",
+        height=360, template="plotly_white", margin=dict(l=10, r=10, t=60, b=40),
+    )
+    return fig
+
+
+def fig_activity_timeline(merged, branch_id, branch_name):
+    """Časová osa (Gantt) všech aktivit na pobočce, řádek = pracoviště —
+    dvě barvy překrývající se ve stejném řádku = kolize (dva lidé na jednom místě)."""
+    d = merged.loc[merged["BRANCH_ID"] == branch_id].copy()
+    if d.empty:
+        return None
+    d["WORKSTATION_LABEL"] = "Prac. " + d["WORKSTATION_ID"].astype(str)
+    order = sorted(d["WORKSTATION_LABEL"].unique(), key=lambda s: int(s.split(" ")[1]))
+
+    fig = px.timeline(
+        d, x_start="DATETIME", x_end="END_DATETIME", y="WORKSTATION_LABEL",
+        color="ACTIVITY", hover_data={"EMPLOYEE": True, "DURATION_MIN": True, "WORKSTATION_LABEL": False},
+        category_orders={"WORKSTATION_LABEL": order},
+        title=f"Časová osa aktivit (kontrola překryvů) — {branch_name}",
+    )
+    fig.update_traces(opacity=0.85, marker_line_width=0.5, marker_line_color="rgba(0,0,0,0.35)")
+    fig.update_yaxes(autorange="reversed", title=None)
+    fig.update_xaxes(title="Čas", rangeslider_visible=True)
+    fig.update_layout(
+        height=max(320, 42 * len(order) + 160), template="plotly_white",
+        margin=dict(l=10, r=10, t=60, b=40), legend_title_text="Aktivita",
     )
     return fig
 
@@ -537,6 +585,17 @@ details.branch-block[open] summary { border-radius: 8px 8px 0 0; }
 footer { text-align: center; color: #888; font-size: 12px; margin-top: 50px; }
 .legend span { display: inline-flex; align-items: center; gap: 6px; margin-right: 18px; font-size: 12.5px; }
 .legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.branch-picker { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+.branch-picker label { font-weight: 600; font-size: 14px; }
+.branch-picker select {
+    font-size: 15px; padding: 9px 14px; border-radius: 8px; border: 1px solid #C9D2DA;
+    background: white; min-width: 320px; cursor: pointer;
+}
+.branch-dash { display: none; }
+.branch-dash.active { display: block; }
+.branch-dash-header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+.branch-dash-header h2 { margin-top: 0; border: none; padding-bottom: 0; }
+.no-data-panel { padding: 40px 20px; text-align: center; color: #888; }
 """
 
 
@@ -593,41 +652,15 @@ def build_html_report(
         # Plotly.js se vloží celý přímo do souboru (ne přes CDN), aby report šel
         # otevřít i bez internetu (e-mail, sdílený disk, offline prohlížení).
         nonlocal plotly_cdn_included
+        if fig is None:
+            return ""
         html = fig.to_html(full_html=False, include_plotlyjs=(True if not plotly_cdn_included else False), config={"displaylogo": False})
         plotly_cdn_included = True
         return html
 
+    # --- Přehled všech poboček -------------------------------------------------
     branch_bar_html = fig_html(fig_branch_utilization_bar(branch_summary))
     trend_html = fig_html(fig_utilization_trend(branch_daily)) if branch_daily["DATE"].nunique() > 1 else ""
-    activity_html = fig_html(fig_activity_mix(activity_breakdown)) if not activity_breakdown.empty else ""
-    employee_html = fig_html(fig_employee_top(employee_summary)) if not employee_summary.empty else ""
-
-    workstation_summary = summarize_workstations(workstation_daily)
-
-    heatmap_blocks = []
-    for branch_id in sorted(workstation_daily["BRANCH_ID"].unique()):
-        name = workstation_daily.loc[workstation_daily["BRANCH_ID"] == branch_id, "BRANCH_NAME"].iloc[0]
-
-        ws_table_html = _df_to_html_table(
-            workstation_summary.loc[workstation_summary["BRANCH_ID"] == branch_id].rename(columns={
-                "WORKSTATION_ID": "Pracoviště", "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
-                "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
-                "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
-            })[["Pracoviště", "Prům. vytíženost", "Max. vytíženost", "Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]],
-            bucket_col="Stav",
-            float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
-        )
-
-        fig = fig_workstation_heatmap(workstation_daily, branch_id, name)
-        heatmap_blocks.append(
-            f'<details class="branch-block"><summary>{name} ({branch_id})</summary>'
-            f'<div style="padding:14px">'
-            f'<h3>Vytíženost jednotlivých pracovišť (celé období)</h3>'
-            f'{ws_table_html}'
-            f'<div style="margin-top:18px">{fig_html(fig)}</div>'
-            f'</div></details>'
-        )
-    heatmaps_html = "\n".join(heatmap_blocks) if heatmap_blocks else "<p>Žádná data k dispozici.</p>"
 
     branch_table_html = _df_to_html_table(
         branch_summary.rename(columns={
@@ -640,26 +673,128 @@ def build_html_report(
         float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
     )
 
-    exceeded = growth_flags.loc[growth_flags["PREKROCENO"]].drop(columns="PREKROCENO")
-    if not exceeded.empty:
-        growth_html = _df_to_html_table(exceeded.rename(columns={
-            "BRANCH_NAME": "Pobočka", "BRANCH_ID": "ID",
-            "POUZITA_PRACOVISTE": "Využitá pracoviště (dle dat)",
-            "NO_WORKSTATIONS": "Registrováno ve work_spaces.xlsx", "ROZDIL": "Rozdíl",
-        }))
-    else:
-        growth_html = "<p>Ve sledovaném období nebyla zjištěna žádná pobočka, kde by se využívalo víc pracovišť, než je registrováno.</p>"
+    # --- Detail jednotlivých poboček (přepínač nahoře) -------------------------
+    workstation_summary = summarize_workstations(workstation_daily)
+    growth_by_branch = growth_flags.set_index("BRANCH_ID")
+    branches_with_data = set(merged["BRANCH_ID"].unique())
 
-    overlaps_html = (
-        _df_to_html_table(overlaps.head(200).rename(columns={
-            "BRANCH_ID": "ID pobočky", "BRANCH_NAME": "Pobočka", "WORKSTATION_ID": "Pracoviště",
-            "PREDCHOZI_ZAMESTNANEC": "Předchozí zaměstnanec", "PREDCHOZI_START": "Předchozí od",
-            "PREDCHOZI_END": "Předchozí do", "ZAMESTNANEC": "Zaměstnanec",
-            "START": "Od", "END": "Do", "ACTIVITY": "Aktivita",
-        }))
-        if not overlaps.empty
-        else "<p>Nebyly nalezeny žádné časové kolize mezi sousedícími rezervacemi stejného pracoviště.</p>"
-    )
+    branch_order = branch_summary["BRANCH_ID"].tolist()  # už seřazeno dle vytíženosti, "Bez dat" naposled
+    first_with_data = next((bid for bid in branch_order if bid in branches_with_data), branch_order[0] if branch_order else None)
+
+    option_tags = []
+    dash_blocks = []
+
+    for branch_id in branch_order:
+        row = branch_summary.loc[branch_summary["BRANCH_ID"] == branch_id].iloc[0]
+        branch_name = row["BRANCH_NAME"]
+        has_data = branch_id in branches_with_data
+        pct_label = f"{row['PRUMERNA_VYTIZENOST_PCT']:.0f} %" if pd.notna(row["PRUMERNA_VYTIZENOST_PCT"]) else "bez dat"
+        selected_attr = " selected" if branch_id == first_with_data else ""
+        option_tags.append(f'<option value="{branch_id}"{selected_attr}>{branch_name} ({branch_id}) — {pct_label}</option>')
+
+        active_class = " active" if branch_id == first_with_data else ""
+
+        if not has_data:
+            dash_blocks.append(
+                f'<div id="branch-{branch_id}" class="branch-dash{active_class}">'
+                f'<div class="no-data-panel">Pro pobočku <strong>{branch_name} ({branch_id})</strong> '
+                f'nejsou v bo_data.xlsx zaznamenané žádné aktivity.</div></div>'
+            )
+            continue
+
+        b_merged = merged.loc[merged["BRANCH_ID"] == branch_id]
+        b_ws_summary = workstation_summary.loc[workstation_summary["BRANCH_ID"] == branch_id]
+        b_activity_breakdown = compute_activity_breakdown(b_merged)
+        b_employee_summary = compute_employee_summary(b_merged)
+        b_overlaps = overlaps.loc[overlaps["BRANCH_ID"] == branch_id]
+        b_growth = growth_by_branch.loc[branch_id] if branch_id in growth_by_branch.index else None
+
+        n_activities = len(b_merged)
+        b_hours = b_merged["DURATION_MIN"].sum() / 60
+        b_used_ws = int(b_merged["WORKSTATION_ID"].nunique())
+        b_registered_ws = int(row["NO_WORKSTATIONS"])
+
+        kpi_html = f"""
+        <div class="card-row">
+          <div class="card"><div class="label">Celkem aktivit</div><div class="value">{n_activities:,}</div></div>
+          <div class="card"><div class="label">Celkem hodin</div><div class="value">{b_hours:.1f} h</div></div>
+          <div class="card"><div class="label">Průměrná vytíženost</div><div class="value">{row['PRUMERNA_VYTIZENOST_PCT']:.1f} %</div></div>
+          <div class="card"><div class="label">Max. denní vytíženost</div><div class="value">{row['MAX_VYTIZENOST_PCT']:.1f} %</div></div>
+          <div class="card"><div class="label">Využitá / registrovaná pracoviště</div><div class="value">{b_used_ws} / {b_registered_ws}</div></div>
+        </div>
+        """
+
+        ws_table_html = _df_to_html_table(
+            b_ws_summary.rename(columns={
+                "WORKSTATION_ID": "Pracoviště", "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
+                "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
+                "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
+            })[["Pracoviště", "Prům. vytíženost", "Max. vytíženost", "Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]],
+            bucket_col="Stav",
+            float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
+        )
+
+        b_daily = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id]
+        daily_bar_html = fig_html(fig_branch_daily_bar(branch_daily, branch_id, branch_name)) if b_daily["DATE"].nunique() > 1 else ""
+        heatmap_html = fig_html(fig_workstation_heatmap(workstation_daily, branch_id, branch_name))
+        timeline_html = fig_html(fig_activity_timeline(merged, branch_id, branch_name))
+        activity_mix_html = fig_html(fig_activity_mix(b_activity_breakdown)) if not b_activity_breakdown.empty else ""
+        employee_html = (
+            fig_html(fig_employee_top(b_employee_summary, title=f"Nejvytíženější zaměstnanci — {branch_name}"))
+            if not b_employee_summary.empty else ""
+        )
+
+        growth_note_html = ""
+        if b_growth is not None and bool(b_growth["PREKROCENO"]):
+            growth_note_html = (
+                f'<p class="note" style="color:#C62828">⚠ Na pobočce se v datech využívá '
+                f'{int(b_growth["POUZITA_PRACOVISTE"])} pracovišť, ale ve work_spaces.xlsx je registrováno jen '
+                f'{int(b_growth["NO_WORKSTATIONS"])} — zvažte navýšení kapacity v evidenci.</p>'
+            )
+
+        overlaps_html = (
+            _df_to_html_table(b_overlaps.rename(columns={
+                "WORKSTATION_ID": "Pracoviště",
+                "PREDCHOZI_ZAMESTNANEC": "Předchozí zaměstnanec", "PREDCHOZI_START": "Předchozí od",
+                "PREDCHOZI_END": "Předchozí do", "ZAMESTNANEC": "Zaměstnanec",
+                "START": "Od", "END": "Do", "ACTIVITY": "Aktivita",
+            })[["Pracoviště", "Předchozí zaměstnanec", "Předchozí od", "Předchozí do", "Zaměstnanec", "Od", "Do", "Aktivita"]])
+            if not b_overlaps.empty
+            else "<p>Nebyly nalezeny žádné časové kolize mezi sousedícími rezervacemi na této pobočce.</p>"
+        )
+
+        activity_employee_block = "" if not activity_mix_html and not employee_html else f'''
+          <div style="display:flex; gap:24px; flex-wrap:wrap; margin-top:22px">
+            <div style="flex:1 1 420px">{activity_mix_html}</div>
+            <div style="flex:1 1 420px">{employee_html}</div>
+          </div>'''
+
+        dash_blocks.append(f"""
+        <div id="branch-{branch_id}" class="branch-dash{active_class}">
+          <div class="branch-dash-header"><h2>{branch_name} ({branch_id})</h2></div>
+          {kpi_html}
+          {growth_note_html}
+
+          <h3>Vytíženost jednotlivých pracovišť (celé období)</h3>
+          {ws_table_html}
+
+          {"" if not daily_bar_html else f'<div style="margin-top:22px">{daily_bar_html}</div>'}
+
+          <div style="margin-top:22px">{heatmap_html}</div>
+
+          <h3 style="margin-top:26px">Časová osa aktivit — kontrola překryvů</h3>
+          <p class="note">Každý řádek je jedno pracoviště, barvy odlišují typ aktivity. Pokud se na stejném řádku
+          časově překrývají dva úseky, jde o kolizi (dva lidé na jednom pracovišti současně) — najeďte myší pro detail.
+          Posuvník pod grafem slouží k přiblížení konkrétního období.</p>
+          {timeline_html}
+          {activity_employee_block}
+
+          <h3 style="margin-top:26px">Kontrola kolizí rezervací (textově)</h3>
+          <div class="table-scroll">{overlaps_html}</div>
+        </div>""")
+
+    options_html = "\n".join(option_tags)
+    dash_html = "\n".join(dash_blocks)
 
     data_quality_bits = []
     if not data_issues.empty:
@@ -674,6 +809,11 @@ def build_html_report(
             "— tyto aktivity nejsou v reportu zahrnuty.</li>"
         )
     data_quality_html = f"<ul>{''.join(data_quality_bits)}</ul>" if data_quality_bits else "<p>Bez zjištěných problémů v datech.</p>"
+
+    branch_select_js = (
+        "document.querySelectorAll('.branch-dash').forEach(function(el){el.classList.remove('active');});"
+        "document.getElementById('branch-'+this.value).classList.add('active');"
+    )
 
     html = f"""<!doctype html>
 <html lang="cs">
@@ -693,7 +833,7 @@ def build_html_report(
   {cards}
 
   <div class="section">
-    <h2>Vytíženost poboček</h2>
+    <h2>Přehled všech poboček</h2>
     <div class="legend">
       <span><i style="background:{BUCKET_COLORS['Nízká']}"></i>Nízká (&lt; {THRESHOLD_HIGH:.0f} %)</span>
       <span><i style="background:{BUCKET_COLORS['Vysoká']}"></i>Vysoká ({THRESHOLD_HIGH:.0f}–{THRESHOLD_CRITICAL:.0f} %)</span>
@@ -712,33 +852,16 @@ def build_html_report(
   </div>'''}
 
   <div class="section">
-    <h2>Vytíženost jednotlivých pracovišť</h2>
-    <p class="note">Rozklikněte pobočku — uvidíte přehlednou tabulku všech jejích pracovišť
-    (vytížené / nevytížené a na kolik %) a pod ní i mapu vytíženosti podle jednotlivých dnů.</p>
-    {heatmaps_html}
-  </div>
-
-  <div class="section">
-    <h2>Kapacita: je pracovišť dost?</h2>
-    <p class="note">Porovnání skutečně využívaných pracovišť (dle unikátních PRACOVISTE_ID v datech) s počtem
-    registrovaným ve work_spaces.xlsx. Časem může na pobočce přibývat pracovišť — tato tabulka na to upozorní.</p>
-    {growth_html}
-  </div>
-
-  {"" if not activity_html and not employee_html else f'''
-  <div class="section">
-    <h2>Skladba aktivit a zaměstnanci</h2>
-    <div style="display:flex; gap:24px; flex-wrap:wrap">
-      <div style="flex:1 1 420px">{activity_html}</div>
-      <div style="flex:1 1 420px">{employee_html}</div>
+    <h2>Detail pobočky</h2>
+    <p class="note">Vyberte pobočku — uvidíte všechna její pracoviště podle čísel a jejich vytížení v čase
+    vůči denní kapacitě, časovou osu aktivit pro kontrolu překryvů, skladbu aktivit a nejvytíženější zaměstnance.</p>
+    <div class="branch-picker">
+      <label for="branch-select">Pobočka:</label>
+      <select id="branch-select" onchange="{branch_select_js}">
+        {options_html}
+      </select>
     </div>
-  </div>'''}
-
-  <div class="section">
-    <h2>Kontrola kolizí rezervací</h2>
-    <p class="note">Zjednodušená kontrola: hledá sousedící (dle času začátku) rezervace stejného pracoviště,
-    které se časově překrývají — může jít o chybu v datech nebo o reálný souběh dvou lidí na jednom místě.</p>
-    <div class="table-scroll">{overlaps_html}</div>
+    {dash_html}
   </div>
 
   <div class="section">
@@ -762,7 +885,7 @@ def build_html_report(
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-03d (tabulka vytíženosti pracovišť po rozkliknutí pobočky)"
+SCRIPT_VERSION = "2026-07-03e (přepínač poboček, časová osa pro kontrolu překryvů)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
