@@ -1145,12 +1145,10 @@ def build_html_report(
             )
 
         activity_employee_block = f'''
-          <div style="display:flex; gap:24px; flex-wrap:wrap; margin-top:22px">
-            <div style="flex:2 1 420px; min-width:0; overflow:hidden">{activity_mix_html}</div>
-            <div style="flex:1 1 320px; min-width:0; overflow:hidden">
-              <h3 style="margin-top:0">Nejvytíženější zaměstnanci</h3>
-              {employee_medals_html}
-            </div>
+          <div style="margin-top:22px">{activity_mix_html}</div>
+          <div style="margin-top:22px">
+            <h3 style="margin-top:0">Nejvytíženější zaměstnanci</h3>
+            {employee_medals_html}
           </div>'''
 
         # --- Denní rozvrhy pracovišť po 10minutových blocích, stránkované po týdnech Po-Ne ---
@@ -1170,6 +1168,9 @@ def build_html_report(
                 f'z celkových {len(week_starts_sorted)}.</p>'
             )
 
+        branch_period_start = b_daily["DATE"].min()
+        branch_period_end = b_daily["DATE"].max()
+
         week_pages = []
         for week_idx, week_start in enumerate(shown_week_starts):
             week_dates_with_data = weeks[week_start]
@@ -1178,6 +1179,10 @@ def build_html_report(
             for wd_offset in range(7):
                 day_date = week_start + pd.Timedelta(days=wd_offset)
                 weekday_label = WEEKDAY_LABELS[wd_offset]
+                if day_date < branch_period_start or day_date > branch_period_end:
+                    # Den je mimo sledované období (ještě nenastal / není v datech) —
+                    # neoznačovat jako "zavřeno", prostě ho v týdnu vynecháme.
+                    continue
                 if day_date in week_dates_with_data:
                     day_row = b_daily_indexed.loc[day_date]
                     day_fig = fig_workstation_day_blocks(merged, branch_id, branch_name, day_date, poledni_pauza)
@@ -1192,6 +1197,8 @@ def build_html_report(
           <div class="week-day-block closed">
             <div class="week-day-heading">{weekday_label} {day_date:%d.%m.%Y} — zavřeno / bez aktivit</div>
           </div>""")
+            if not day_sections:
+                continue
             active_class = " active" if week_idx == len(shown_week_starts) - 1 else ""
             week_pages.append(
                 f'<div class="week-page{active_class}" data-label="{week_label}">{"".join(day_sections)}</div>'
@@ -1322,7 +1329,7 @@ function stepWeek(btn, delta) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-10 (týdenní přepínač denních rozvrhů, medaile top 3, progress bary Po-Ne, oprava překryvu grafů)"
+SCRIPT_VERSION = "2026-07-10b (skladba aktivit pod zaměstnanci, dny mimo období se v týdnu nezobrazují jako zavřeno)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
