@@ -22,6 +22,7 @@ import math
 import re
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -548,10 +549,14 @@ def fig_workstation_heatmap(workstation_daily, branch_id, branch_name):
     pivot = d.pivot_table(index="DATE", columns="WORKSTATION_LABEL", values="UTILIZATION_PCT")
     pivot = pivot.reindex(sorted(pivot.columns, key=lambda c: int(c.split(" ")[1])), axis=1)
 
+    # Přesně 0.0 % (žádná aktivita) se má vykreslit jako světle šedá/prázdná, ne zelená —
+    # proto těsně nad nulou barva "skočí" na zelenou (epsilon = zlomek procenta z rozsahu).
+    zero_eps = 0.3 / 150
     fig = go.Figure(go.Heatmap(
         z=pivot.values, x=pivot.columns, y=[d.strftime("%d.%m.%Y") for d in pivot.index],
         colorscale=[
-            [0.0, STATUS_GOOD], [THRESHOLD_HIGH / 150, STATUS_WARNING],
+            [0.0, GRIDLINE], [zero_eps, GRIDLINE],
+            [zero_eps, STATUS_GOOD], [THRESHOLD_HIGH / 150, STATUS_WARNING],
             [THRESHOLD_CRITICAL / 150, STATUS_CRITICAL], [1.0, "#7a1414"],
         ],
         zmin=0, zmax=150, colorbar=dict(title="%", outlinewidth=0, tickfont=dict(color=TEXT_MUTED)),
@@ -619,110 +624,65 @@ def fig_branch_daily_bar(branch_daily, branch_id, branch_name):
     return _style_chart(fig)
 
 
-def _pack_dot_grid(count, cell_x, cell_y, dot_spacing=0.11, max_per_row=6, row_height=0.16):
-    """Napakuje `count` teček do malé mřížky vystředěné na (cell_x, cell_y) —
-    stejný princip jako v referenčním "unit chart" (waffle/dot plot)."""
-    if count <= 0:
-        return []
-    n_rows = math.ceil(count / max_per_row)
-    positions = []
-    idx = 0
-    for row in range(n_rows):
-        n_in_row = min(max_per_row, count - idx)
-        row_width = (n_in_row - 1) * dot_spacing
-        x_start = cell_x - row_width / 2
-        y = cell_y + (row - (n_rows - 1) / 2) * row_height
-        for i in range(n_in_row):
-            positions.append((x_start + i * dot_spacing, y))
-            idx += 1
-    return positions
-
-
-def _hex_to_rgba(hex_color, alpha):
-    h = hex_color.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return f"rgba({r},{g},{b},{alpha})"
-
-
-def fig_hourly_unit_chart(merged, workstation_summary, branch_id, branch_name):
-    """Unit/dot chart: pracoviště pobočky seřazená zleva doprava (podle čísla),
-    v každém sloupci tečky reprezentující aktivity podle hodiny dne, kdy vznikly.
-    Tečka je plná, pokud hodina spadá do mezikvartilového rozpětí daného pracoviště
-    (typická provozní doba), a slabší mimo něj — stejný princip jako v přiloženém vzoru."""
+def fig_workstation_time_profile(merged, branch_daily, branch_id, branch_name, block_minutes=BLOCK_MINUTES):
+    """Vytíženost pracovišť podle času dne za CELÉ sledované období — stejný rastr
+    jako denní rozvrh po blocích, ale místo jednoho dne ukazuje četnost napříč všemi
+    dny: barva = v kolika % otevřených dní bylo dané pracoviště v daném čase obsazené
+    (od průhledné/prázdné = nikdy, po tmavě modrou = prakticky vždy)."""
     d = merged.loc[merged["BRANCH_ID"] == branch_id].copy()
-    if d.empty:
-        return None, 1
-    d["HOUR"] = d["DATETIME"].dt.hour
-
     ws_ids = sorted(d["WORKSTATION_ID"].unique())
-    ws_index = {ws: i for i, ws in enumerate(ws_ids)}
+    if not ws_ids or d.empty:
+        return None
 
-    bucket_by_ws = (
-        workstation_summary.loc[workstation_summary["BRANCH_ID"] == branch_id]
-        .set_index("WORKSTATION_ID")["BUCKET"]
-    )
+    total_days = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id, "DATE"].nunique()
+    if total_days == 0:
+        return None
 
-    counts = d.groupby(["WORKSTATION_ID", "HOUR"]).size()
-    max_count = int(counts.max()) if not counts.empty else 1
-    unit = max(1, math.ceil(max_count / 28))  # kolik aktivit reprezentuje 1 tečka (drží graf čitelný)
+    d["TOD_START"] = d["DATETIME"].dt.hour * 60 + d["DATETIME"].dt.minute
+    d["TOD_END"] = d["TOD_START"] + d["DURATION_MIN"]
 
-    xs, ys, colors, hover = [], [], [], []
-    for (ws, hour), cnt in counts.items():
-        ws_hours = d.loc[d["WORKSTATION_ID"] == ws, "HOUR"]
-        ws_p25, ws_p75 = ws_hours.quantile(0.25), ws_hours.quantile(0.75)
-        in_core = ws_p25 <= hour <= ws_p75
-        base_color = BUCKET_COLORS.get(bucket_by_ws.get(ws, "Bez dat"), STATUS_MUTED)
-        color = _hex_to_rgba(base_color, 0.95 if in_core else 0.38)
+    day_start = int(np.floor(d["TOD_START"].min() / block_minutes) * block_minutes)
+    day_end = int(np.ceil(d["TOD_END"].max() / block_minutes) * block_minutes)
+    if day_end - day_start < 120:
+        day_end = day_start + 120
 
-        n_dots = max(1, round(cnt / unit))
-        for dx, dy in _pack_dot_grid(n_dots, ws_index[ws], hour):
-            xs.append(dx)
-            ys.append(dy)
-            colors.append(color)
-            hover.append(f"Prac. {ws} · {hour:02d}:00–{hour + 1:02d}:00<br>{cnt} aktivit")
+    n_blocks = (day_end - day_start) // block_minutes
+    block_labels = []
+    for i in range(n_blocks):
+        m = day_start + i * block_minutes
+        block_labels.append(f"{(m // 60) % 24:02d}:{m % 60:02d}")
 
-    fig = go.Figure(go.Scatter(
-        x=xs, y=ys, mode="markers",
-        marker=dict(size=8, color=colors, line=dict(width=1, color=SURFACE)),
-        hovertext=hover, hoverinfo="text",
+    ws_row = {ws: i for i, ws in enumerate(ws_ids)}
+    occ = defaultdict(set)
+    for r in d.itertuples(index=False):
+        row_i = ws_row[r.WORKSTATION_ID]
+        c0 = max(0, int((r.TOD_START - day_start) // block_minutes))
+        c1 = min(n_blocks, math.ceil((r.TOD_END - day_start) / block_minutes))
+        for c in range(c0, c1):
+            occ[(row_i, c)].add(r.DATE)
+
+    z = np.zeros((len(ws_ids), n_blocks))
+    for (row_i, c), dates in occ.items():
+        z[row_i, c] = len(dates) / total_days * 100
+
+    tick_step = max(1, 60 // block_minutes)
+    tick_idx = list(range(0, n_blocks, tick_step))
+
+    fig = go.Figure(go.Heatmap(
+        z=z, x=block_labels, y=[f"Prac. {w}" for w in ws_ids],
+        zmin=0, zmax=100,
+        colorscale=[[0.0, "rgba(42,120,214,0)"], [1.0, "rgba(42,120,214,1)"]],
+        colorbar=dict(title="% dní", outlinewidth=0, tickfont=dict(color=TEXT_MUTED)),
+        hovertemplate="%{y} · %{x}<br>Obsazeno %{z:.0f} % otevřených dní<extra></extra>",
+        xgap=1, ygap=2,
     ))
-
-    hours_all = d["HOUR"]
-    p25, p50, p75 = hours_all.quantile([0.25, 0.5, 0.75])
-    fig.add_hrect(y0=p25, y1=p75, fillcolor=TEXT_MUTED, opacity=0.07, line_width=0)
-    # p25/p75 se mohou po zaokrouhlení na celou hodinu shodovat (úzké rozpětí) — svislý
-    # posun popisků od sebe zaručí, že se text nikdy nepřekryje, i když čáry splynou.
-    fig.add_hline(y=p25, line_dash="dot", line_color=TEXT_MUTED, line_width=1,
-                  annotation_text=f"p25={p25:.0f}", annotation_position="left", annotation_font=dict(color=TEXT_MUTED, size=10),
-                  annotation_xshift=-16, annotation_yshift=-9)
-    fig.add_hline(y=p75, line_dash="dot", line_color=TEXT_MUTED, line_width=1,
-                  annotation_text=f"p75={p75:.0f}", annotation_position="left", annotation_font=dict(color=TEXT_MUTED, size=10),
-                  annotation_xshift=-16, annotation_yshift=9)
-
-    shapes, annotations = [], []
-    for ws in ws_ids:
-        col_x = ws_index[ws]
-        med = d.loc[d["WORKSTATION_ID"] == ws, "HOUR"].median()
-        shapes.append(dict(type="line", x0=col_x - 0.38, x1=col_x + 0.38, y0=med, y1=med, line=dict(color=TEXT_PRIMARY, width=2)))
-        annotations.append(dict(x=col_x + 0.42, y=med, text=f"{med:.0f}h", showarrow=False, font=dict(size=10, color=TEXT_PRIMARY), xanchor="left"))
-
-    hour_span = int(hours_all.max() - hours_all.min()) + 3
+    fig.update_xaxes(tickmode="array", tickvals=[block_labels[i] for i in tick_idx], title=None)
+    fig.update_yaxes(autorange="reversed", title=None)
     fig.update_layout(
-        shapes=shapes, annotations=annotations,
-        title=(
-            f"Hodinové rozložení aktivit podle pracoviště — {branch_name}"
-            + (f" (1 tečka ≈ {unit} akt.)" if unit > 1 else "")
-        ),
-        xaxis=dict(
-            tickvals=list(ws_index.values()), ticktext=[f"Prac. {w}" for w in ws_ids],
-            range=[-0.6, len(ws_ids) - 0.4], title=None,
-        ),
-        yaxis=dict(title="Hodina dne", dtick=1, range=[hours_all.min() - 1.2, hours_all.max() + 1.2]),
-        height=max(420, 34 * hour_span),
+        title=f"Vytíženost pracovišť podle času dne — {branch_name} (celé období, {total_days} dní)",
+        height=max(260, 34 * len(ws_ids) + 140),
     )
-    _style_chart(fig)
-    fig.update_layout(margin=dict(l=70, r=30, t=50, b=40))
-    return fig, unit
+    return _style_chart(fig)
 
 
 def _discrete_colorscale(colors):
@@ -1075,8 +1035,7 @@ def build_html_report(
 
         daily_bar_html = fig_html(fig_branch_daily_bar(branch_daily, branch_id, branch_name)) if b_daily["DATE"].nunique() > 1 else ""
         heatmap_html = fig_html(fig_workstation_heatmap(workstation_daily, branch_id, branch_name))
-        hourly_fig, _hourly_unit = fig_hourly_unit_chart(merged, workstation_summary, branch_id, branch_name)
-        hourly_html = fig_html(hourly_fig)
+        time_profile_html = fig_html(fig_workstation_time_profile(merged, branch_daily, branch_id, branch_name))
         activity_mix_html = fig_html(fig_activity_mix(b_activity_breakdown)) if not b_activity_breakdown.empty else ""
         employee_html = (
             fig_html(fig_employee_top(b_employee_summary, title=f"Nejvytíženější zaměstnanci — {branch_name}"))
@@ -1140,13 +1099,12 @@ def build_html_report(
           <h3 style="margin-top:26px">Vytíženost jednotlivých pracovišť (za jednotlivé dny)</h3>
           <div style="margin-top:6px">{heatmap_html}</div>
 
-          <h3 style="margin-top:26px">Hodinové rozložení aktivit podle pracoviště</h3>
-          <p class="note">Pracoviště seřazená zleva doprava podle čísla. Každá tečka je jedna aktivita (nebo
-          skupina aktivit, viz titulek grafu) umístěná podle hodiny dne, kdy začala — sloupec tak ukazuje, ve
-          které hodiny je dané pracoviště typicky vytížené. Plné tečky leží v mezikvartilovém rozpětí (typická
-          provozní doba) daného pracoviště, slabší tečky jsou mimo něj. Vodorovná čára u každého sloupce je
-          medián hodiny pro dané pracoviště; šedý pás je mezikvartilové rozpětí (p25–p75) za celou pobočku.</p>
-          {hourly_html}
+          <h3 style="margin-top:26px">Vytíženost pracovišť podle času dne (celé období)</h3>
+          <p class="note">Stejný rastr jako denní rozvrh níže (řádek = pracoviště od nejnižšího čísla nahoře,
+          sloupec = čas dne po {BLOCK_MINUTES}minutových blocích), ale sečtený přes všechny otevřené dny ve
+          sledovaném období. Barva = v kolika % dní bylo dané pracoviště v danou dobu obsazené — od průhledné
+          (nikdy) po tmavě modrou (téměř vždy). Ukazuje tak typický denní vzorec vytížení pracoviště.</p>
+          {time_profile_html}
 
           <h3 style="margin-top:26px">Denní rozvrh pracovišť po {BLOCK_MINUTES} minutách</h3>
           <p class="note">Pracoviště seřazená od nejnižšího čísla nahoře, čas po ose x v blocích po
@@ -1217,7 +1175,7 @@ def build_html_report(
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-09 (týdenní kapacita, víkend/polední pauza, segmenty, denní rozvrh po blocích)"
+SCRIPT_VERSION = "2026-07-09b (celoobdobní heatmapa času dne, 0% šedě v heatmapě, bez matoucího dot-plotu)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
