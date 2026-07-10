@@ -1155,9 +1155,11 @@ def build_html_report(
         b_daily_indexed = b_daily.set_index("DATE")
         weeks = {}
         for d in b_merged["DATE"].unique():
+            # d může přijít jako numpy.datetime64 (podle verze pandas) — normalizujeme
+            # na pd.Timestamp, jinak selže "in" test níže kvůli neshodě hashů mezi typy.
             ts = pd.Timestamp(d)
             week_start = ts - pd.Timedelta(days=ts.weekday())
-            weeks.setdefault(week_start, set()).add(d)
+            weeks.setdefault(week_start, set()).add(ts)
         week_starts_sorted = sorted(weeks.keys())
         shown_week_starts = week_starts_sorted[-MAX_WEEKS_PER_BRANCH:]
 
@@ -1329,7 +1331,7 @@ function stepWeek(btn, delta) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-10b (skladba aktivit pod zaměstnanci, dny mimo období se v týdnu nezobrazují jako zavřeno)"
+SCRIPT_VERSION = "2026-07-10c (oprava: dny s reálnými aktivitami se v týdenním rozvrhu chybně ukazovaly jako zavřeno kvůli neshodě typů numpy.datetime64/Timestamp)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
