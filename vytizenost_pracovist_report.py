@@ -23,7 +23,6 @@ import re
 import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -699,26 +698,91 @@ def fig_activity_mix(activity_breakdown):
     return _style_chart(fig, legend=False)
 
 
-def fig_branch_daily_bar(branch_daily, branch_id, branch_name):
-    """Denní vytíženost JEDNÉ pobočky (sloupcový graf po dnech) — obdoba "Room Utilization Rate"."""
-    d = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id].sort_values("DATE")
-    colors = d["BUCKET"].map(BUCKET_COLORS).fillna(STATUS_MUTED)
+def compute_aggregated_utilization(merged_scope, daily_frame, branch_id, granularity):
+    """Vytíženost agregovaná na jednu ze čtyř úrovní (hodiny/dny/týdny/měsíce) pro
+    přepínatelný graf v detailu pobočky. `daily_frame` musí mít sloupec
+    BRANCH_CAPACITY_MIN (u pilotní budovy jde o efektivní, nepřítomností sníženou
+    kapacitu) — vytíženost je vždy odpracované minuty / dostupná kapacita.
+    "Hodiny" = průměrný denní vzorec (% využití dané hodiny dne přes celé období),
+    ostatní úrovně jsou prostý součet přes dané období."""
+    d = daily_frame.dropna(subset=["DATE"]).copy()
+    if d.empty:
+        return pd.DataFrame(columns=["LABEL", "SORT_KEY", "UTILIZATION_PCT"])
+
+    if granularity == "hours":
+        m = merged_scope.loc[merged_scope["BRANCH_ID"] == branch_id]
+        n_open_days = d["DATE"].nunique()
+        avg_daily_capacity_min = d["BRANCH_CAPACITY_MIN"].mean()
+        capacity_per_hour_min = (avg_daily_capacity_min / 24) if pd.notna(avg_daily_capacity_min) else 0.0
+        by_hour = m.groupby(m["DATETIME"].dt.hour)["DURATION_MIN"].sum() if not m.empty else pd.Series(dtype=float)
+        rows = []
+        for h in range(24):
+            capacity = capacity_per_hour_min * n_open_days
+            actual = by_hour.get(h, 0.0)
+            pct = (actual / capacity * 100) if capacity > 0 else np.nan
+            rows.append({"LABEL": f"{h:02d}:00", "SORT_KEY": h, "UTILIZATION_PCT": pct})
+        return pd.DataFrame(rows)
+
+    if granularity == "days":
+        out = d[["DATE", "UTILIZATION_PCT"]].copy()
+        out["LABEL"] = out["DATE"].dt.strftime("%d.%m.")
+        out["SORT_KEY"] = out["DATE"]
+        return out.sort_values("SORT_KEY")[["LABEL", "SORT_KEY", "UTILIZATION_PCT"]]
+
+    if granularity == "weeks":
+        d["GROUP_START"] = d["DATE"] - pd.to_timedelta(d["DATE"].dt.weekday, unit="D")
+        label_fmt = "%d.%m."
+    elif granularity == "months":
+        d["GROUP_START"] = d["DATE"].dt.to_period("M").dt.to_timestamp()
+        label_fmt = "%m/%Y"
+    else:
+        raise ValueError(f"Neznámá granularita: {granularity}")
+
+    g = d.groupby("GROUP_START").agg(DURATION_MIN=("DURATION_MIN", "sum"), CAPACITY_MIN=("BRANCH_CAPACITY_MIN", "sum")).reset_index()
+    g["UTILIZATION_PCT"] = np.where(g["CAPACITY_MIN"] > 0, g["DURATION_MIN"] / g["CAPACITY_MIN"] * 100, np.nan)
+    g["LABEL"] = g["GROUP_START"].dt.strftime(label_fmt)
+    g["SORT_KEY"] = g["GROUP_START"]
+    return g.sort_values("SORT_KEY")[["LABEL", "SORT_KEY", "UTILIZATION_PCT"]]
+
+
+def fig_aggregated_bar(df, title):
+    if df.empty or df["UTILIZATION_PCT"].isna().all():
+        return None
+    colors = df["UTILIZATION_PCT"].map(lambda p: BUCKET_COLORS.get(utilization_bucket(p), STATUS_MUTED))
     fig = go.Figure(go.Bar(
-        x=[dt.strftime("%d.%m.") for dt in d["DATE"]], y=d["UTILIZATION_PCT"],
-        marker_color=colors, marker_line_width=0,
-        text=d["UTILIZATION_PCT"].round(1).astype(str) + " %", textposition="outside",
+        x=df["LABEL"], y=df["UTILIZATION_PCT"], marker_color=colors, marker_line_width=0,
+        text=df["UTILIZATION_PCT"].round(1).astype(str) + " %", textposition="outside",
         textfont=dict(color=TEXT_SECONDARY, size=11),
         hovertemplate="%{x}<br>Vytíženost: %{y:.1f} %<extra></extra>",
     ))
     fig.add_hline(y=THRESHOLD_HIGH, line_dash="dot", line_color=STATUS_WARNING)
     fig.add_hline(y=THRESHOLD_CRITICAL, line_dash="dot", line_color=STATUS_CRITICAL)
-    fig.add_hline(y=100, line_color=TEXT_MUTED)
-    fig.update_layout(
-        title=f"Denní vytíženost pobočky vůči kapacitě — {branch_name}",
-        xaxis_title=None, yaxis_title="Vytíženost (%)",
-        height=360, bargap=0.35,
-    )
+    fig.update_layout(title=title, xaxis_title=None, yaxis_title="Vytíženost (%)", height=340, bargap=0.3)
     return _style_chart(fig)
+
+
+_GRANULARITY_LABELS = [("hours", "Hodiny"), ("days", "Dny"), ("weeks", "Týdny"), ("months", "Měsíce")]
+
+
+def build_granularity_switcher_html(merged_scope, daily_frame, branch_id, branch_name, fig_html, container_id):
+    """Jeden graf s přepínačem Hodiny/Dny/Týdny/Měsíce (jen jedna stránka viditelná
+    najednou, přepínání beze změny stránky přes stepGranularity() v <script> níže)."""
+    pages, buttons = [], []
+    for key, cz_label in _GRANULARITY_LABELS:
+        df = compute_aggregated_utilization(merged_scope, daily_frame, branch_id, key)
+        fig = fig_aggregated_bar(df, f"Vytíženost podle {cz_label.lower()} — {branch_name}")
+        content = fig_html(fig) if fig is not None else '<p class="note">Žádná data.</p>'
+        active = key == "days"
+        pages.append(f'<div class="gran-page{" active" if active else ""}" data-key="{key}">{content}</div>')
+        buttons.append(
+            f'<button class="gran-btn{" active" if active else ""}" data-key="{key}" '
+            f'onclick="stepGranularity(this,\'{key}\')">{cz_label}</button>'
+        )
+    return f"""
+    <div class="gran-wrap" id="{container_id}">
+      <div class="gran-controls">{"".join(buttons)}</div>
+      {"".join(pages)}
+    </div>"""
 
 
 # --- Pilotní rozšíření: nepřítomnost zaměstnanců a rozdělení na budovy ------
@@ -768,6 +832,7 @@ def compute_pilot_building_daily(merged, branch_id, workstation_range, capacity_
             "BRANCH_ID": branch_id, "DATE": d,
             "N_ACTIVITIES": int(activities_by_date.get(d, 0)), "DURATION_MIN": actual_min,
             "RAW_CAPACITY_MIN": raw_capacity_min, "EFFECTIVE_CAPACITY_MIN": effective_capacity_min,
+            "BRANCH_CAPACITY_MIN": effective_capacity_min,  # alias, aby šlo použít generickou agregaci jako u branch_daily
             "UTILIZATION_PCT": util_pct, "BUCKET": utilization_bucket(util_pct),
         })
     return pd.DataFrame(out)
@@ -857,65 +922,147 @@ def build_front_page_summary(branch_summary, merged, absences):
     return out.sort_values("PRUMERNA_VYTIZENOST_PCT", ascending=False, na_position="last").reset_index(drop=True)
 
 
-def fig_workstation_time_profile(merged, branch_daily, branch_id, branch_name, block_minutes=BLOCK_MINUTES):
-    """Vytíženost pracovišť podle času dne za CELÉ sledované období — stejný rastr
-    jako denní rozvrh po blocích, ale místo jednoho dne ukazuje četnost napříč všemi
-    dny: barva = v kolika % otevřených dní bylo dané pracoviště v daném čase obsazené
-    (od průhledné/prázdné = nikdy, po tmavě modrou = prakticky vždy)."""
-    d = merged.loc[merged["BRANCH_ID"] == branch_id].copy()
-    ws_ids = sorted(d["WORKSTATION_ID"].unique())
-    if not ws_ids or d.empty:
-        return None
-
-    total_days = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id, "DATE"].nunique()
-    if total_days == 0:
-        return None
-
-    d["TOD_START"] = d["DATETIME"].dt.hour * 60 + d["DATETIME"].dt.minute
-    d["TOD_END"] = d["TOD_START"] + d["DURATION_MIN"]
-
-    day_start = int(np.floor(d["TOD_START"].min() / block_minutes) * block_minutes)
-    day_end = int(np.ceil(d["TOD_END"].max() / block_minutes) * block_minutes)
-    if day_end - day_start < 120:
-        day_end = day_start + 120
-
-    n_blocks = (day_end - day_start) // block_minutes
-    block_labels = []
-    for i in range(n_blocks):
-        m = day_start + i * block_minutes
-        block_labels.append(f"{(m // 60) % 24:02d}:{m % 60:02d}")
-
-    ws_row = {ws: i for i, ws in enumerate(ws_ids)}
-    occ = defaultdict(set)
-    for r in d.itertuples(index=False):
-        row_i = ws_row[r.WORKSTATION_ID]
-        c0 = max(0, int((r.TOD_START - day_start) // block_minutes))
-        c1 = min(n_blocks, math.ceil((r.TOD_END - day_start) / block_minutes))
-        for c in range(c0, c1):
-            occ[(row_i, c)].add(r.DATE)
-
-    z = np.zeros((len(ws_ids), n_blocks))
-    for (row_i, c), dates in occ.items():
-        z[row_i, c] = len(dates) / total_days * 100
-
-    tick_step = max(1, 60 // block_minutes)
-    tick_idx = list(range(0, n_blocks, tick_step))
-
-    fig = go.Figure(go.Heatmap(
-        z=z, x=block_labels, y=[f"Prac. {w}" for w in ws_ids],
-        zmin=0, zmax=100,
-        colorscale=[[0.0, "rgba(42,120,214,0)"], [1.0, "rgba(42,120,214,1)"]],
-        colorbar=dict(title="% dní", outlinewidth=0, tickfont=dict(color=TEXT_MUTED)),
-        hovertemplate="%{y} · %{x}<br>Obsazeno %{z:.0f} % otevřených dní<extra></extra>",
-        xgap=1, ygap=2,
-    ))
-    fig.update_xaxes(tickmode="array", tickvals=[block_labels[i] for i in tick_idx], title=None)
-    fig.update_yaxes(autorange="reversed", title=None)
-    fig.update_layout(
-        title=f"Vytíženost pracovišť podle času dne — {branch_name} (celé období, {total_days} dní)",
-        height=max(260, 34 * len(ws_ids) + 140),
+def build_combined_daily_calendar_data(branch_daily, merged, absences):
+    """Denní vytíženost SEČTENÁ přes všechny pobočky dohromady (pro kalendářový
+    přehled na titulní stránce) — pilotní pobočka se počítá po budovách s
+    efektivní (nepřítomností sníženou) kapacitou, stejně jako jinde v reportu."""
+    non_pilot = branch_daily.loc[branch_daily["BRANCH_ID"] != PILOT_BRANCH_ID]
+    daily = (
+        non_pilot.groupby("DATE")
+        .agg(DURATION_MIN=("DURATION_MIN", "sum"), CAPACITY_MIN=("BRANCH_CAPACITY_MIN", "sum"))
+        .reset_index()
     )
-    return _style_chart(fig)
+
+    b_merged_all = merged.loc[merged["BRANCH_ID"] == PILOT_BRANCH_ID]
+    if not b_merged_all.empty:
+        capacity_min_per_workstation = b_merged_all["CAPACITY_MIN"].iloc[0]
+        absences_df = absences if absences is not None else pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
+        employee_base = set(b_merged_all["EMPLOYEE"].unique()) | (set(absences_df["EMPLOYEE"].unique()) if not absences_df.empty else set())
+        absence_daily = compute_absence_daily(absences_df, employee_base)
+
+        pilot_frames = []
+        for ws_range in PILOT_BUILDINGS.values():
+            bd = compute_pilot_building_daily(merged, PILOT_BRANCH_ID, list(ws_range), capacity_min_per_workstation, absence_daily)
+            if not bd.empty:
+                pilot_frames.append(bd[["DATE", "DURATION_MIN", "EFFECTIVE_CAPACITY_MIN"]].rename(columns={"EFFECTIVE_CAPACITY_MIN": "CAPACITY_MIN"}))
+        if pilot_frames:
+            daily = pd.concat([daily] + pilot_frames, ignore_index=True).groupby("DATE").agg(
+                DURATION_MIN=("DURATION_MIN", "sum"), CAPACITY_MIN=("CAPACITY_MIN", "sum")
+            ).reset_index()
+
+    daily["UTILIZATION_PCT"] = np.where(daily["CAPACITY_MIN"] > 0, daily["DURATION_MIN"] / daily["CAPACITY_MIN"] * 100, np.nan)
+    return daily.sort_values("DATE").reset_index(drop=True)
+
+
+MONTH_NAMES = [
+    "Leden", "Únor", "Březen", "Duben", "Květen", "Červen",
+    "Červenec", "Srpen", "Září", "Říjen", "Listopad", "Prosinec",
+]
+
+
+def _green_shade(intensity):
+    """Lineární interpolace mezi velmi světle zelenou (0) a sytě zelenou (1) —
+    barevná škála kalendářového přehledu (žádná bucket sémantika, jen intenzita)."""
+    intensity = max(0.0, min(1.0, intensity))
+    c0, c1 = (237, 247, 237), (10, 122, 10)
+    r = round(c0[0] + (c1[0] - c0[0]) * intensity)
+    g = round(c0[1] + (c1[1] - c0[1]) * intensity)
+    b = round(c0[2] + (c1[2] - c0[2]) * intensity)
+    return f"rgb({r},{g},{b})"
+
+
+def build_month_calendar_html(daily_combined):
+    """Kalendářový přehled: dny vybraného měsíce v mřížce Po–Ne, sytost zelené =
+    kombinovaná vytíženost všech poboček dohromady. Měsíce se přepínají šipkami
+    (stejný vzor jako týdenní navigátor u denního rozvrhu pracovišť)."""
+    valid = daily_combined.dropna(subset=["UTILIZATION_PCT"])
+    if valid.empty:
+        return '<p class="note">Žádná data pro kalendářový přehled.</p>'
+
+    daily_indexed = daily_combined.set_index("DATE")["UTILIZATION_PCT"]
+    max_pct = valid["UTILIZATION_PCT"].max()
+    max_pct = max_pct if max_pct > 0 else 100.0
+
+    months = sorted({(d.year, d.month) for d in daily_combined["DATE"]})
+    weekday_header = "".join(f"<div class='cal-weekday'>{lbl}</div>" for lbl in WEEKDAY_LABELS)
+
+    month_pages = []
+    for idx, (year, month) in enumerate(months):
+        month_start = pd.Timestamp(year=year, month=month, day=1)
+        month_end = month_start + pd.offsets.MonthEnd(0)
+        grid_start = month_start - pd.Timedelta(days=month_start.weekday())
+        grid_end = month_end + pd.Timedelta(days=(6 - month_end.weekday()))
+
+        cells = []
+        d = grid_start
+        while d <= grid_end:
+            in_month = d.month == month
+            pct = daily_indexed.get(d, np.nan) if in_month else np.nan
+            if not in_month:
+                cells.append('<div class="cal-cell out"></div>')
+            elif pd.isna(pct):
+                cells.append(f'<div class="cal-cell muted" title="{d:%d.%m.%Y} — bez dat"><span class="cal-day">{d.day}</span></div>')
+            else:
+                bg = _green_shade(pct / max_pct)
+                cells.append(
+                    f'<div class="cal-cell" style="background:{bg}" title="{d:%d.%m.%Y} — {pct:.1f}% vytíženo">'
+                    f'<span class="cal-day">{d.day}</span><span class="cal-pct">{pct:.0f}%</span></div>'
+                )
+            d += pd.Timedelta(days=1)
+
+        month_label = f"{MONTH_NAMES[month - 1]} {year}"
+        active_class = " active" if idx == len(months) - 1 else ""
+        month_pages.append(
+            f'<div class="month-page{active_class}" data-label="{month_label}">'
+            f'<div class="cal-weekday-row">{weekday_header}</div>'
+            f'<div class="cal-grid">{"".join(cells)}</div></div>'
+        )
+
+    default_label = f"{MONTH_NAMES[months[-1][1] - 1]} {months[-1][0]}"
+    return f"""
+    <div class="month-nav-wrap" id="monthnav-overview">
+      <div class="week-nav-controls">
+        <button class="week-prev" onclick="stepMonth(this,-1)" {"disabled" if len(months) <= 1 else ""}>◀ Předchozí měsíc</button>
+        <span class="week-label">{default_label}</span>
+        <button class="week-next" onclick="stepMonth(this,1)" disabled>Další měsíc ▶</button>
+      </div>
+      {"".join(month_pages)}
+    </div>"""
+
+
+def build_branch_overview_table_html(front_page_summary):
+    """Ruční tabulka (místo _df_to_html_table) — celý řádek je klikatelný a
+    naviguje na ukotvení detailu dané pobočky (#branch-{id}); nativní chování
+    prohlížeče díky tomu otevře příslušný <details> a odscrolluje na něj."""
+    cols = [
+        ("Pobočka", "BRANCH_NAME"), ("ID", "BRANCH_ID"), ("Poč. pracovišť", "NO_WORKSTATIONS"),
+        ("Kapacita (h/den)", "CAPACITY_DAY_HOURS"), ("Efektivní kapacita (h/den)", "EFFECTIVE_CAPACITY_DAY_HOURS"),
+        ("Prům. vytíženost", "PRUMERNA_VYTIZENOST_PCT"), ("Max. vytíženost", "MAX_VYTIZENOST_PCT"),
+        ("Dní kriticky vytíž.", "DNI_KRITICKA"), ("Odprac. hodin", "CELKEM_HODIN"),
+        ("Dní s daty", "POCET_DNI"), ("Stav", "BUCKET"),
+    ]
+    header_html = "".join(f"<th>{label}</th>" for label, _ in cols)
+
+    rows_html = []
+    for _, row in front_page_summary.iterrows():
+        anchor = f"branch-{int(row['BRANCH_ID'])}"
+        cells = []
+        for label, key in cols:
+            v = row[key]
+            if key == "BUCKET":
+                cells.append(f"<td>{_bucket_badge(v)}</td>")
+            elif key in ("CAPACITY_DAY_HOURS", "EFFECTIVE_CAPACITY_DAY_HOURS", "CELKEM_HODIN"):
+                cells.append(f"<td>{v:.1f}</td>" if pd.notna(v) else "<td>—</td>")
+            elif key in ("PRUMERNA_VYTIZENOST_PCT", "MAX_VYTIZENOST_PCT"):
+                cells.append(f"<td>{v:.1f} %</td>" if pd.notna(v) else "<td>—</td>")
+            else:
+                cells.append(f"<td>{v}</td>")
+        rows_html.append(f'<tr class="branch-row" onclick="goToBranch(\'{anchor}\')">{"".join(cells)}</tr>')
+
+    return f"""<table class="report">
+      <thead><tr>{header_html}</tr></thead>
+      <tbody>{"".join(rows_html)}</tbody>
+    </table>"""
 
 
 def _discrete_colorscale(colors):
@@ -1075,17 +1222,6 @@ footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px
 .medal-value { font-size: 20px; font-weight: 700; margin-top: 2px; }
 .medal-sub { font-size: 11.5px; color: #898781; margin-top: 2px; }
 
-/* Progress bary (vytíženost podle dne v týdnu) */
-.table-scroll-x { overflow-x: auto; }
-table.progress-table { min-width: 640px; }
-table.progress-table td.ws-cell { font-weight: 600; white-space: nowrap; }
-table.progress-table td.closed-cell { color: #c3c2b7; font-size: 11.5px; text-align: center; font-style: italic; }
-.progress-cell { display: flex; align-items: center; gap: 8px; min-width: 90px; }
-.progress-cell.over .progress-track { border: 1px solid #d03b3b; }
-.progress-track { flex: 1 1 auto; height: 8px; border-radius: 4px; background: #e1e0d9; overflow: hidden; }
-.progress-fill { height: 100%; border-radius: 4px; }
-.progress-label { font-size: 11.5px; color: #52514e; white-space: nowrap; min-width: 34px; text-align: right; }
-
 /* Pilotní rozšíření: budovy (nepřítomnost a kapacita) */
 .building-block { margin-top: 18px; padding: 14px 16px; border: 1px solid #e1e0d9; border-radius: 10px; }
 .building-block h4 { margin: 0 0 6px 0; font-size: 14px; }
@@ -1106,6 +1242,37 @@ table.progress-table td.closed-cell { color: #c3c2b7; font-size: 11.5px; text-al
 .week-day-block.closed { padding: 10px 14px; }
 .week-day-heading { font-weight: 600; font-size: 12.5px; color: #52514e; margin-bottom: 6px; }
 .week-day-block.closed .week-day-heading { color: #c3c2b7; font-style: italic; margin-bottom: 0; }
+
+/* Přepínač granularity (Hodiny/Dny/Týdny/Měsíce) */
+.gran-controls { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.gran-btn {
+    font-size: 13px; padding: 7px 14px; border-radius: 18px; border: 1px solid #c3c2b7;
+    background: #fcfcfb; cursor: pointer; color: #0b0b0b;
+}
+.gran-btn:hover { background: #f0efec; }
+.gran-btn.active { background: #0b0b0b; color: #fcfcfb; border-color: #0b0b0b; }
+.gran-page { display: none; }
+.gran-page.active { display: block; }
+
+/* Kalendářní přehled (titulní strana) */
+.month-nav-wrap { margin-top: 10px; }
+.month-page { display: none; }
+.month-page.active { display: block; }
+.cal-weekday-row { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 6px; }
+.cal-weekday { text-align: center; font-size: 11.5px; color: #898781; font-weight: 600; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.cal-cell {
+    aspect-ratio: 1 / 0.75; border-radius: 8px; padding: 6px 8px; display: flex;
+    flex-direction: column; justify-content: space-between; border: 1px solid rgba(11,11,11,0.06);
+}
+.cal-cell.out { border: none; background: transparent; }
+.cal-cell.muted { background: #f4f3f0; color: #c3c2b7; }
+.cal-day { font-size: 12px; font-weight: 600; }
+.cal-pct { font-size: 11px; align-self: flex-end; color: #0b0b0b; }
+
+/* Klikatelný řádek v přehledu poboček */
+tr.branch-row { cursor: pointer; }
+tr.branch-row:hover { background: #f0efec; }
 """
 
 
@@ -1196,47 +1363,7 @@ def _employee_medals_html(employee_summary, n=3):
     return f'<div class="medal-row">{"".join(cards)}</div>'
 
 
-def _progress_bar_html(pct, color):
-    fill_pct = min(100, max(0, pct)) if pd.notna(pct) else 0
-    label = f"{pct:.0f} %" if pd.notna(pct) else "—"
-    over_class = " over" if pd.notna(pct) and pct > 100 else ""
-    return f"""<div class="progress-cell{over_class}">
-      <div class="progress-track"><div class="progress-fill" style="width:{fill_pct:.0f}%; background:{color}"></div></div>
-      <span class="progress-label">{label}</span>
-    </div>"""
-
-
 WEEKDAY_LABELS = ["Po", "Út", "St", "Čt", "Pá", "So", "Ne"]
-
-
-def build_weekday_progress_table_html(workstation_daily, branch_id):
-    """Tabulka pracovišť s progress bary — průměrná vytíženost za jednotlivé dny
-    v týdnu (Po–Ne), zprůměrovaná přes všechny výskyty daného dne v období."""
-    d = workstation_daily.loc[workstation_daily["BRANCH_ID"] == branch_id].copy()
-    if d.empty:
-        return "<p class=\"note\">Žádná data.</p>"
-    d["WEEKDAY"] = d["DATE"].dt.weekday
-    pivot = d.groupby(["WORKSTATION_ID", "WEEKDAY"])["UTILIZATION_PCT"].mean().unstack("WEEKDAY")
-
-    rows_html = []
-    for ws in sorted(pivot.index):
-        cells = [f'<td class="ws-cell">Prac. {ws}</td>']
-        for wd in range(7):
-            if wd in pivot.columns and pd.notna(pivot.loc[ws, wd]):
-                pct = pivot.loc[ws, wd]
-                color = BUCKET_COLORS.get(utilization_bucket(pct), STATUS_MUTED)
-                cells.append(f"<td>{_progress_bar_html(pct, color)}</td>")
-            else:
-                cells.append('<td class="closed-cell">zavřeno</td>')
-        rows_html.append(f"<tr>{''.join(cells)}</tr>")
-
-    header = "<th>Pracoviště</th>" + "".join(f"<th>{lbl}</th>" for lbl in WEEKDAY_LABELS)
-    return f"""<div class="table-scroll-x">
-    <table class="report progress-table">
-      <thead><tr>{header}</tr></thead>
-      <tbody>{"".join(rows_html)}</tbody>
-    </table>
-    </div>"""
 
 
 def render_branch_body(
@@ -1312,12 +1439,11 @@ def render_branch_body(
         float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
     )
 
-    daily_bar_html = fig_html(fig_branch_daily_bar(daily_frame, branch_id, branch_name)) if b_daily["DATE"].nunique() > 1 else ""
+    gran_container_id = f"gran-{branch_id}-{'-'.join(str(i) for i in ws_ids) if ws_ids else 'all'}"
+    gran_switcher_html = build_granularity_switcher_html(merged_scope, daily_frame, branch_id, branch_name, fig_html, gran_container_id)
     heatmap_html = fig_html(fig_workstation_heatmap(workstation_daily_scope, branch_id, branch_name))
-    time_profile_html = fig_html(fig_workstation_time_profile(merged_scope, daily_frame, branch_id, branch_name))
     activity_mix_html = fig_html(fig_activity_mix(b_activity_breakdown)) if not b_activity_breakdown.empty else ""
     employee_medals_html = _employee_medals_html(b_employee_summary)
-    weekday_progress_html = build_weekday_progress_table_html(workstation_daily_scope, branch_id)
 
     activity_employee_block = f'''
       <div style="margin-top:22px">{activity_mix_html}</div>
@@ -1402,22 +1528,13 @@ def render_branch_body(
       <h3>Vytíženost jednotlivých pracovišť (celé období)</h3>
       {ws_table_html}
 
-      {"" if not daily_bar_html else f'<div style="margin-top:22px">{daily_bar_html}</div>'}
-
-      <h3 style="margin-top:26px">Průměrná vytíženost pracovišť podle dne v týdnu (Po–Ne)</h3>
-      <p class="note">Průměrná vytíženost každého pracoviště za každý den v týdnu, zprůměrovaná přes všechny
-      výskyty daného dne ve sledovaném období. Dny, kdy je pobočka zavřená, jsou označené „zavřeno".</p>
-      {weekday_progress_html}
+      <h3 style="margin-top:26px">Vytíženost v čase</h3>
+      <p class="note">Přepínač Hodiny/Dny/Týdny/Měsíce mění úroveň agregace stejného grafu. "Hodiny" ukazuje
+      průměrný denní vzorec (kolik % kapacity dané hodiny se v průměru využije) za celé sledované období.</p>
+      {gran_switcher_html}
 
       <h3 style="margin-top:26px">Vytíženost jednotlivých pracovišť (za jednotlivé dny)</h3>
       <div style="margin-top:6px">{heatmap_html}</div>
-
-      <h3 style="margin-top:26px">Vytíženost pracovišť podle času dne (celé období)</h3>
-      <p class="note">Stejný rastr jako denní rozvrh níže (řádek = pracoviště od nejnižšího čísla nahoře,
-      sloupec = čas dne po {BLOCK_MINUTES}minutových blocích), ale sečtený přes všechny otevřené dny ve
-      sledovaném období. Barva = v kolika % dní bylo dané pracoviště v danou dobu obsazené — od průhledné
-      (nikdy) po tmavě modrou (téměř vždy). Ukazuje tak typický denní vzorec vytížení pracoviště.</p>
-      {time_profile_html}
 
       <h3 style="margin-top:26px">Denní rozvrh pracovišť po {BLOCK_MINUTES} minutách</h3>
       <p class="note">Pracoviště seřazená od nejnižšího čísla nahoře, čas po ose x v blocích po
@@ -1490,23 +1607,10 @@ def build_html_report(
     # Pilotní pobočka (PILOT_BRANCH_ID) se tu rozděluje na dvě budovy s vlastní
     # (efektivní, nepřítomností sníženou) kapacitou — viz build_front_page_summary.
     front_page_summary = build_front_page_summary(branch_summary, merged, absences)
-    branch_bar_html = fig_html(fig_branch_utilization_bar(front_page_summary))
+    branch_table_html = build_branch_overview_table_html(front_page_summary)
 
-    branch_table_html = _df_to_html_table(
-        front_page_summary.rename(columns={
-            "BRANCH_NAME": "Pobočka", "BRANCH_ID": "ID", "NO_WORKSTATIONS": "Poč. pracovišť",
-            "CAPACITY_DAY_HOURS": "Kapacita (h/den)", "EFFECTIVE_CAPACITY_DAY_HOURS": "Efektivní kapacita (h/den)",
-            "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
-            "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
-            "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
-        })[["Pobočka", "ID", "Poč. pracovišť", "Kapacita (h/den)", "Efektivní kapacita (h/den)",
-            "Prům. vytíženost", "Max. vytíženost", "Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]],
-        bucket_col="Stav",
-        float_cols={
-            "Kapacita (h/den)": "{:.1f}", "Efektivní kapacita (h/den)": "{:.1f}", "Prům. vytíženost": "{:.1f} %",
-            "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}",
-        },
-    )
+    combined_daily = build_combined_daily_calendar_data(branch_daily, merged, absences)
+    calendar_html = build_month_calendar_html(combined_daily)
 
     # --- Rozbalovací karta pro každou pobočku -----------------------------------
     workstation_summary = summarize_workstations(workstation_daily, segments)
@@ -1523,7 +1627,7 @@ def build_html_report(
 
         if not has_data:
             branch_blocks.append(f"""
-        <details class="branch-block">
+        <details class="branch-block" id="branch-{branch_id}">
           <summary>{branch_name} ({branch_id}) <span class="branch-summary-line">bez dat</span></summary>
           <div class="branch-body no-data-panel">Pro pobočku <strong>{branch_name} ({branch_id})</strong>
           nejsou v bo_data.xlsx zaznamenané žádné aktivity.</div>
@@ -1585,7 +1689,7 @@ def build_html_report(
         </div>""")
 
             branch_blocks.append(f"""
-        <details class="branch-block">
+        <details class="branch-block" id="branch-{branch_id}">
           <summary>{branch_name} ({branch_id})
             <span class="branch-summary-line">2 budovy · {b_hours_total:.0f} h · {n_activities_total} aktivit</span>
           </summary>
@@ -1612,7 +1716,7 @@ def build_html_report(
         )
 
         branch_blocks.append(f"""
-        <details class="branch-block">
+        <details class="branch-block" id="branch-{branch_id}">
           <summary>{branch_name} ({branch_id})
             <span class="branch-summary-line">{row['PRUMERNA_VYTIZENOST_PCT']:.0f}% vytíženo · {b_hours:.0f} h · {n_activities} aktivit</span>
           </summary>
@@ -1647,19 +1751,24 @@ def build_html_report(
       <span><i style="background:{BUCKET_COLORS['Vysoká']}"></i>Vysoká ({THRESHOLD_HIGH:.0f}–{THRESHOLD_CRITICAL:.0f} %)</span>
       <span><i style="background:{BUCKET_COLORS['Kritická']}"></i>Kritická (&gt; {THRESHOLD_CRITICAL:.0f} %)</span>
     </div>
-    {branch_bar_html}
     <div class="table-scroll">{branch_table_html}</div>
     <p class="note">Vytíženost pobočky = odpracované minuty / (počet pracovišť × kapacita pracoviště v min/den),
     zprůměrováno přes dny, kdy je pobočka otevřená, ve sledovaném období. Denní kapacita pracoviště se počítá
     z týdenní otevírací doby (CAPACITY) dělené počtem otevřených dní v týdnu (5, nebo 7 pro víkendové pobočky).
-    Pobočky bez dat v bo_data.xlsx jsou uvedeny se stavem „Bez dat".</p>
+    Pobočky bez dat v bo_data.xlsx jsou uvedeny se stavem „Bez dat". Klikněte na řádek pobočky pro její detail níže.</p>
+
+    <h3 style="margin-top:26px">Kalendářní přehled vytíženosti (všechny pobočky dohromady)</h3>
+    <p class="note">Sytost zelené = kombinovaná vytíženost všech poboček daný den (odpracované minuty vůči
+    dostupné kapacitě, u pilotní pobočky efektivní po odečtení nepřítomných zaměstnanců). Šipkami přepínáte
+    měsíce.</p>
+    {calendar_html}
   </div>
 
   <div class="section">
     <h2>Detail pobočky</h2>
-    <p class="note">Rozklikněte pobočku — uvidíte vytíženost jejích pracovišť za celé období i po jednotlivých
-    dnech, hodinové rozložení aktivit, denní rozvrh pracovišť po {BLOCK_MINUTES} minutách a skladbu aktivit
-    se zaměstnanci.</p>
+    <p class="note">Rozklikněte pobočku (nebo na ni klikněte v přehledu výše) — uvidíte vytíženost jejích
+    pracovišť za celé období i po jednotlivých dnech, agregaci vytíženosti podle hodin/dnů/týdnů/měsíců, denní
+    rozvrh pracovišť po {BLOCK_MINUTES} minutách a skladbu aktivit se zaměstnanci.</p>
     {branch_blocks_html}
   </div>
 
@@ -1677,6 +1786,35 @@ function stepWeek(btn, delta) {{
   wrap.querySelector('.week-prev').disabled = (next === 0);
   wrap.querySelector('.week-next').disabled = (next === pages.length - 1);
 }}
+
+function stepMonth(btn, delta) {{
+  var wrap = btn.closest('.month-nav-wrap');
+  var pages = wrap.querySelectorAll('.month-page');
+  var cur = 0;
+  pages.forEach(function(p, i) {{ if (p.classList.contains('active')) cur = i; }});
+  var next = Math.max(0, Math.min(pages.length - 1, cur + delta));
+  pages.forEach(function(p, i) {{ p.classList.toggle('active', i === next); }});
+  wrap.querySelector('.week-label').textContent = pages[next].dataset.label;
+  wrap.querySelector('.week-prev').disabled = (next === 0);
+  wrap.querySelector('.week-next').disabled = (next === pages.length - 1);
+}}
+
+function stepGranularity(btn, key) {{
+  var wrap = btn.closest('.gran-wrap');
+  wrap.querySelectorAll('.gran-page').forEach(function(p) {{
+    p.classList.toggle('active', p.dataset.key === key);
+  }});
+  wrap.querySelectorAll('.gran-btn').forEach(function(b) {{
+    b.classList.toggle('active', b.dataset.key === key);
+  }});
+}}
+
+function goToBranch(id) {{
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.open = true;
+  el.scrollIntoView({{behavior: 'smooth', block: 'start'}});
+}}
 </script>
 </body>
 </html>
@@ -1692,7 +1830,7 @@ function stepWeek(btn, delta) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-15b (přehled všech poboček: Jugoslávská rozdělena na budovy + sloupec efektivní kapacity)"
+SCRIPT_VERSION = "2026-07-16 (redesign: tabulkový přehled bez grafu, kalendář vytíženosti, klikatelné řádky, agregace hodiny/dny/týdny/měsíce v detailu pobočky)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
