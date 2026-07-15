@@ -801,6 +801,62 @@ def fig_building_capacity(building_daily, building_name, n_workstations):
     return _style_chart(fig, legend=True)
 
 
+def build_front_page_summary(branch_summary, merged, absences):
+    """Přehled pro titulní stránku ("Přehled všech poboček"): běžné pobočky beze
+    změny (jen doplněný sloupec EFFECTIVE_CAPACITY_DAY_HOURS = CAPACITY_DAY_HOURS,
+    protože bez dat o nepřítomnosti není co odečítat), PILOT_BRANCH_ID rozdělený
+    na dvě budovy s vlastní (efektivní) kapacitou — stejná logika jako v detailu
+    pobočky, jen agregovaná za celé sledované období."""
+    absences_df = absences if absences is not None else pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
+    rows = []
+    for _, row in branch_summary.iterrows():
+        if row["BRANCH_ID"] != PILOT_BRANCH_ID:
+            rows.append({**row.to_dict(), "EFFECTIVE_CAPACITY_DAY_HOURS": row["CAPACITY_DAY_HOURS"]})
+            continue
+
+        branch_id = row["BRANCH_ID"]
+        branch_name = row["BRANCH_NAME"]
+        b_merged_all = merged.loc[merged["BRANCH_ID"] == branch_id]
+        if b_merged_all.empty:
+            rows.append({**row.to_dict(), "EFFECTIVE_CAPACITY_DAY_HOURS": row["CAPACITY_DAY_HOURS"]})
+            continue
+
+        capacity_min_per_workstation = b_merged_all["CAPACITY_MIN"].iloc[0]
+        employee_base = set(b_merged_all["EMPLOYEE"].unique()) | (set(absences_df["EMPLOYEE"].unique()) if not absences_df.empty else set())
+        absence_daily = compute_absence_daily(absences_df, employee_base)
+
+        for building_name, ws_range in PILOT_BUILDINGS.items():
+            ws_ids = list(ws_range)
+            n_ws = len(ws_ids)
+            raw_capacity_day_hours = n_ws * capacity_min_per_workstation / 60
+            b_daily_building = compute_pilot_building_daily(merged, branch_id, ws_ids, capacity_min_per_workstation, absence_daily)
+            if b_daily_building.empty:
+                rows.append({
+                    "BRANCH_ID": branch_id, "BRANCH_NAME": f"{branch_name} — {building_name}",
+                    "NO_WORKSTATIONS": n_ws,
+                    "CAPACITY_DAY_HOURS": raw_capacity_day_hours,
+                    "EFFECTIVE_CAPACITY_DAY_HOURS": raw_capacity_day_hours,
+                    "PRUMERNA_VYTIZENOST_PCT": np.nan, "MAX_VYTIZENOST_PCT": np.nan,
+                    "DNI_KRITICKA": 0, "CELKEM_HODIN": 0.0, "POCET_DNI": 0, "BUCKET": "Bez dat",
+                })
+                continue
+            rows.append({
+                "BRANCH_ID": branch_id, "BRANCH_NAME": f"{branch_name} — {building_name}",
+                "NO_WORKSTATIONS": n_ws,
+                "CAPACITY_DAY_HOURS": raw_capacity_day_hours,
+                "EFFECTIVE_CAPACITY_DAY_HOURS": b_daily_building["EFFECTIVE_CAPACITY_MIN"].mean() / 60,
+                "PRUMERNA_VYTIZENOST_PCT": b_daily_building["UTILIZATION_PCT"].mean(),
+                "MAX_VYTIZENOST_PCT": b_daily_building["UTILIZATION_PCT"].max(),
+                "DNI_KRITICKA": int((b_daily_building["BUCKET"] == "Kritická").sum()),
+                "CELKEM_HODIN": b_daily_building["DURATION_MIN"].sum() / 60,
+                "POCET_DNI": int(b_daily_building["DATE"].nunique()),
+                "BUCKET": utilization_bucket(b_daily_building["UTILIZATION_PCT"].mean()),
+            })
+
+    out = pd.DataFrame(rows)
+    return out.sort_values("PRUMERNA_VYTIZENOST_PCT", ascending=False, na_position="last").reset_index(drop=True)
+
+
 def fig_workstation_time_profile(merged, branch_daily, branch_id, branch_name, block_minutes=BLOCK_MINUTES):
     """Vytíženost pracovišť podle času dne za CELÉ sledované období — stejný rastr
     jako denní rozvrh po blocích, ale místo jednoho dne ukazuje četnost napříč všemi
@@ -1431,18 +1487,23 @@ def build_html_report(
         return html
 
     # --- Přehled všech poboček (jediné, co zůstává na titulní straně) ----------
-    branch_bar_html = fig_html(fig_branch_utilization_bar(branch_summary))
+    # Pilotní pobočka (PILOT_BRANCH_ID) se tu rozděluje na dvě budovy s vlastní
+    # (efektivní, nepřítomností sníženou) kapacitou — viz build_front_page_summary.
+    front_page_summary = build_front_page_summary(branch_summary, merged, absences)
+    branch_bar_html = fig_html(fig_branch_utilization_bar(front_page_summary))
 
     branch_table_html = _df_to_html_table(
-        branch_summary.rename(columns={
+        front_page_summary.rename(columns={
             "BRANCH_NAME": "Pobočka", "BRANCH_ID": "ID", "NO_WORKSTATIONS": "Poč. pracovišť",
-            "CAPACITY_DAY_HOURS": "Kapacita (h/den)", "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
+            "CAPACITY_DAY_HOURS": "Kapacita (h/den)", "EFFECTIVE_CAPACITY_DAY_HOURS": "Efektivní kapacita (h/den)",
+            "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
             "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
             "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
-        }),
+        })[["Pobočka", "ID", "Poč. pracovišť", "Kapacita (h/den)", "Efektivní kapacita (h/den)",
+            "Prům. vytíženost", "Max. vytíženost", "Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]],
         bucket_col="Stav",
         float_cols={
-            "Kapacita (h/den)": "{:.1f}", "Prům. vytíženost": "{:.1f} %",
+            "Kapacita (h/den)": "{:.1f}", "Efektivní kapacita (h/den)": "{:.1f}", "Prům. vytíženost": "{:.1f} %",
             "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}",
         },
     )
@@ -1631,7 +1692,7 @@ function stepWeek(btn, delta) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-15 (pobočka Jugoslávská plně přepočítaná po budovách - 16 vs. 4 pracovišť, vytíženost vůči efektivní kapacitě po odečtení nepřítomnosti)"
+SCRIPT_VERSION = "2026-07-15b (přehled všech poboček: Jugoslávská rozdělena na budovy + sloupec efektivní kapacity)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
