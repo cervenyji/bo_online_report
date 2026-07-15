@@ -38,7 +38,8 @@ from IPython.display import IFrame, display
 
 BO_DATA_FILE = "bo_data.xlsx"
 WORKSPACES_FILE = "qr_codes_bo_online.xlsx"
-SEGMENTS_FILE = "segmenty_pracovist.xlsx"  # převodník BRANCH_ID+PRACOVISTE_ID -> SEGMENT (upravte název/cestu podle svého souboru)
+SEGMENTS_FILE = WORKSPACES_FILE  # segmenty (BRANCH_ID, PRACOVISTE_ID, SEGMENT) bývají jako list
+SEGMENTS_SHEET_NAME = "struktura_pracovist_segmenty"  # uvnitř qr_codes_bo_online.xlsx, ne samostatný soubor
 OUTPUT_HTML = "vytizenost_report.html"  # ke jménu se při každém běhu přidá časové razítko (viz níže),
                                          # aby prohlížeč/Jupyter nikdy nezobrazoval starou zkešovanou verzi souboru
 
@@ -147,9 +148,15 @@ def _xlsx_read_styles_date_flags(z):
     return date_flags
 
 
+class SheetNotFoundError(ValueError):
+    """List (podle jména) nebyl v sešitu nalezen — odlišeno od ostatních ValueError,
+    aby ho volající mohl chytit zvlášť (např. list se segmenty je nepovinný)."""
+
+
 def read_xlsx_rows(path, sheet_index=0):
     """Přečte list .xlsx souboru a vrátí seznam řádků (list řádků, každý je list buněk).
-    Rozpozná datumové buňky podle formátu ve stylu a rovnou je vrátí jako datetime."""
+    Rozpozná datumové buňky podle formátu ve stylu a rovnou je vrátí jako datetime.
+    `sheet_index` může být pořadové číslo (0 = první list), nebo jméno listu (str)."""
     with zipfile.ZipFile(path) as z:
         shared_strings = []
         if "xl/sharedStrings.xml" in z.namelist():
@@ -162,6 +169,12 @@ def read_xlsx_rows(path, sheet_index=0):
 
         workbook_root = ET.fromstring(z.read("xl/workbook.xml"))
         sheet_els = workbook_root.findall(f"{_XLSX_NS}sheets/{_XLSX_NS}sheet")
+        if isinstance(sheet_index, str):
+            matches = [i for i, el in enumerate(sheet_els) if el.get("name") == sheet_index]
+            if not matches:
+                available = [el.get("name") for el in sheet_els]
+                raise SheetNotFoundError(f"List '{sheet_index}' nebyl v souboru {path} nalezen. Dostupné listy: {available}")
+            sheet_index = matches[0]
         rels_root = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
         rels = {r.get("Id"): r.get("Target") for r in rels_root}
         target = rels[sheet_els[sheet_index].get(f"{_XLSX_REL_NS}id")]
@@ -316,14 +329,18 @@ def load_workspaces(path):
     return df.reset_index(drop=True)
 
 
-def load_segments(path):
-    """Načte převodník BRANCH_ID+PRACOVISTE_ID -> SEGMENT. Pokud soubor chybí
-    (např. ještě není pro všechny pobočky připravený), vrátí prázdnou tabulku
-    a report jen zobrazí segment jako „—" — nic nespadne."""
+def load_segments(path, sheet_name=SEGMENTS_SHEET_NAME):
+    """Načte převodník BRANCH_ID+PRACOVISTE_ID -> SEGMENT. Bývá jako list `sheet_name`
+    uvnitř work_spaces.xlsx (ne samostatný soubor). Pokud soubor/list chybí (např.
+    ještě není pro všechny pobočky připravený), vrátí prázdnou tabulku a report jen
+    zobrazí segment jako „—" — nic nespadne."""
     try:
-        raw = read_xlsx(path)
+        raw = read_xlsx(path, sheet_index=sheet_name)
     except (FileNotFoundError, zipfile.BadZipFile):
         print(f"Pozor: soubor se segmenty '{path}' nebyl nalezen — sloupec SEGMENT bude prázdný.")
+        return pd.DataFrame(columns=["BRANCH_ID", "WORKSTATION_ID", "SEGMENT"])
+    except SheetNotFoundError:
+        print(f"Pozor: list '{sheet_name}' se segmenty v souboru '{path}' nebyl nalezen — sloupec SEGMENT bude prázdný.")
         return pd.DataFrame(columns=["BRANCH_ID", "WORKSTATION_ID", "SEGMENT"])
     if raw.shape[1] < 3:
         raise ValueError(f"Soubor {path} má jen {raw.shape[1]} sloupců, očekává se 3: BRANCH_ID, PRACOVISTE_ID, SEGMENT")
@@ -1541,7 +1558,7 @@ function stepWeek(btn, delta) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-14 (pilotní rozšíření: nepřítomnost zaměstnanců a rozdělení na budovy pro pobočku Jugoslávská)"
+SCRIPT_VERSION = "2026-07-14b (segmenty se čtou z listu struktura_pracovist_segmenty uvnitř qr_codes_bo_online.xlsx)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
