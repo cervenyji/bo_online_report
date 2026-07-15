@@ -1639,16 +1639,22 @@ def build_html_report(
                 n_activities_total += len(b_merged_building)
                 b_hours_total += b_merged_building["DURATION_MIN"].sum() / 60
 
-                body_html = render_branch_body(
-                    merged=merged, workstation_summary=workstation_summary,
-                    daily_frame=b_daily_building, branch_id=branch_id, branch_name=f"{branch_name} — {building_name}",
-                    n_workstations_registered=n_ws, fig_html=fig_html, workstation_filter=ws_ids,
-                )
+                # Pozor na pořadí: fig_html() vloží celou knihovnu Plotly.js jen při
+                # PRVNÍM volání a další grafy na ni jen odkazují — proto se musí volat
+                # ve stejném pořadí, v jakém se výsledné <script> tagy objeví v HTML
+                # (capacity_fig_html je v DOM PŘED body_html), jinak pozdější graf
+                # spustí svůj <script> dřív, než se knihovna vůbec načte.
                 capacity_fig_html = ""
                 if not b_merged_building.empty:
                     fig_cap = fig_building_capacity(b_daily_building, building_name, n_ws)
                     if fig_cap is not None:
                         capacity_fig_html = f'<div style="margin-top:18px">{fig_html(fig_cap)}</div>'
+
+                body_html = render_branch_body(
+                    merged=merged, workstation_summary=workstation_summary,
+                    daily_frame=b_daily_building, branch_id=branch_id, branch_name=f"{branch_name} — {building_name}",
+                    n_workstations_registered=n_ws, fig_html=fig_html, workstation_filter=ws_ids,
+                )
 
                 building_bodies.append(f"""
         <div class="building-block">
@@ -1799,7 +1805,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-16b (kalendář: % aktivit a obsazená pracoviště v boxíku, kontrastní text; odebrán graf nepřítomnosti a denní heatmapa pracovišť; týdenní rozvrh sloučen do jedné heatmapy)"
+SCRIPT_VERSION = "2026-07-16c (oprava: graf efektivní kapacity u pilotní pobočky se nevykresloval - Plotly.js knihovna se v DOM načítala až po skriptu, co ji potřeboval)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
