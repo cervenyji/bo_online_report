@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -163,14 +164,21 @@ def read_xlsx_rows(path, sheet_index=0):
             root = ET.fromstring(z.read("xl/sharedStrings.xml"))
             for si in root.findall(f"{_XLSX_NS}si"):
                 text = "".join(t.text or "" for t in si.iter(f"{_XLSX_NS}t"))
-                shared_strings.append(text)
+                # Excel/export nástroje mohou diakritiku zapsat rozloženě (NFD, "i" +
+                # combining accent) místo složeně (NFC) - sjednotíme, jinak stejně
+                # vypadající text ("Příjmení") při porovnání != nesedí.
+                shared_strings.append(unicodedata.normalize("NFC", text))
 
         date_flags = _xlsx_read_styles_date_flags(z)
 
         workbook_root = ET.fromstring(z.read("xl/workbook.xml"))
         sheet_els = workbook_root.findall(f"{_XLSX_NS}sheets/{_XLSX_NS}sheet")
         if isinstance(sheet_index, str):
-            matches = [i for i, el in enumerate(sheet_els) if el.get("name") == sheet_index]
+            sheet_index_norm = unicodedata.normalize("NFC", sheet_index)
+            matches = [
+                i for i, el in enumerate(sheet_els)
+                if el.get("name") and unicodedata.normalize("NFC", el.get("name")) == sheet_index_norm
+            ]
             if not matches:
                 available = [el.get("name") for el in sheet_els]
                 raise SheetNotFoundError(f"List '{sheet_index}' nebyl v souboru {path} nalezen. Dostupné listy: {available}")
@@ -194,7 +202,10 @@ def read_xlsx_rows(path, sheet_index=0):
 
                 if v_el is None:
                     is_el = c.find(f"{_XLSX_NS}is")
-                    value = "".join(t.text or "" for t in is_el.iter(f"{_XLSX_NS}t")) if is_el is not None else None
+                    if is_el is not None:
+                        value = unicodedata.normalize("NFC", "".join(t.text or "" for t in is_el.iter(f"{_XLSX_NS}t")))
+                    else:
+                        value = None
                 else:
                     raw = v_el.text
                     if cell_type == "s":
@@ -202,7 +213,7 @@ def read_xlsx_rows(path, sheet_index=0):
                     elif cell_type == "b":
                         value = bool(int(raw))
                     elif cell_type == "str":
-                        value = raw
+                        value = unicodedata.normalize("NFC", raw)
                     else:
                         num = float(raw)
                         if style_idx < len(date_flags) and date_flags[style_idx]:
@@ -1558,7 +1569,7 @@ function stepWeek(btn, delta) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-14c (nepřítomnosti: hlavička se v exportu hledá automaticky, ne pevným skiprows)"
+SCRIPT_VERSION = "2026-07-14d (oprava: text z .xlsx se normalizuje na NFC - rozložená diakritika v exportu bránila napárování sloupců)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
