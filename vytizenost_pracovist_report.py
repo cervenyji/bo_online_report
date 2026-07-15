@@ -737,11 +737,14 @@ def fig_absence_daily(absence_daily, branch_name, total_employees):
     return _style_chart(fig)
 
 
-def compute_building_capacity_daily(merged, branch_id, workstation_range, capacity_min_per_workstation, absence_daily):
-    """Pro jednu budovu pilotní pobočky (podmnožina WORKSTATION_ID) spočítá denně:
-    surovou kapacitu (počet pracovišť budovy × kapacita/pracoviště/den), efektivní
-    kapacitu sníženou o poměrný podíl nepřítomných zaměstnanců (dle podílu pracovišť
-    této budovy na celkovém počtu pracovišť pobočky) a skutečně odpracované minuty."""
+def compute_pilot_building_daily(merged, branch_id, workstation_range, capacity_min_per_workstation, absence_daily):
+    """Denní agregace pro JEDNU budovu pilotní pobočky (podmnožina WORKSTATION_ID) —
+    stejný tvar jako branch_daily (BRANCH_ID, DATE, N_ACTIVITIES, DURATION_MIN,
+    UTILIZATION_PCT, BUCKET), takže ji lze beze změny použít ve všech grafech, které
+    jinak očekávají branch_daily. Kapacita = počet pracovišť TÉTO budovy (ne celé
+    pobočky) × kapacita/pracoviště/den, snížená o poměrný podíl nepřítomných
+    zaměstnanců (dle podílu pracovišť budovy na celkovém počtu pracovišť pobočky) —
+    vytíženost se tak počítá vůči efektivní, ne nominální kapacitě."""
     workstation_ids = list(workstation_range)
     n_workstations = len(workstation_ids)
     raw_capacity_min = n_workstations * capacity_min_per_workstation
@@ -749,6 +752,7 @@ def compute_building_capacity_daily(merged, branch_id, workstation_range, capaci
     b = merged.loc[(merged["BRANCH_ID"] == branch_id) & (merged["WORKSTATION_ID"].isin(workstation_ids))]
     dates = pd.bdate_range(b["DATE"].min(), b["DATE"].max()) if not b.empty else pd.DatetimeIndex([])
     usage_by_date = b.groupby("DATE")["DURATION_MIN"].sum() if not b.empty else pd.Series(dtype=float)
+    activities_by_date = b.groupby("DATE").size() if not b.empty else pd.Series(dtype=int)
 
     total_ws_all_buildings = sum(len(list(r)) for r in PILOT_BUILDINGS.values())
     building_share = n_workstations / total_ws_all_buildings if total_ws_all_buildings else 0.0
@@ -758,11 +762,13 @@ def compute_building_capacity_daily(merged, branch_id, workstation_range, capaci
     for d in dates:
         n_absent_building = absence_by_date.get(d, 0.0) * building_share
         effective_capacity_min = max(0.0, raw_capacity_min - n_absent_building * capacity_min_per_workstation)
+        actual_min = usage_by_date.get(d, 0.0)
+        util_pct = (actual_min / effective_capacity_min * 100) if effective_capacity_min > 0 else np.nan
         out.append({
-            "DATE": d,
-            "RAW_CAPACITY_MIN": raw_capacity_min,
-            "EFFECTIVE_CAPACITY_MIN": effective_capacity_min,
-            "ACTUAL_MIN": usage_by_date.get(d, 0.0),
+            "BRANCH_ID": branch_id, "DATE": d,
+            "N_ACTIVITIES": int(activities_by_date.get(d, 0)), "DURATION_MIN": actual_min,
+            "RAW_CAPACITY_MIN": raw_capacity_min, "EFFECTIVE_CAPACITY_MIN": effective_capacity_min,
+            "UTILIZATION_PCT": util_pct, "BUCKET": utilization_bucket(util_pct),
         })
     return pd.DataFrame(out)
 
@@ -783,7 +789,7 @@ def fig_building_capacity(building_daily, building_name, n_workstations):
         name="Efektivní kapacita (po odečtení nepřítomných)", marker_color=STATUS_WARNING, opacity=0.6,
     ))
     fig.add_trace(go.Scatter(
-        x=building_daily["DATE"], y=building_daily["ACTUAL_MIN"] / 60,
+        x=building_daily["DATE"], y=building_daily["DURATION_MIN"] / 60,
         name="Skutečně odpracováno", mode="lines+markers",
         line=dict(color=STATUS_GOOD, width=2), marker=dict(size=6),
     ))
@@ -1177,43 +1183,194 @@ def build_weekday_progress_table_html(workstation_daily, branch_id):
     </div>"""
 
 
-def build_pilot_absence_section(merged, branch_id, branch_name, capacity_min_per_workstation, absences, fig_html):
-    """Pilotní rozšíření JEN pro PILOT_BRANCH_ID: nepřítomnost zaměstnanců a rozdělení
-    na dvě budovy (Jugoslávská 1-4 zatím nenainstalováno, Olbrachtova 5-20)."""
-    b_merged = merged.loc[merged["BRANCH_ID"] == branch_id]
-    employee_base = set(b_merged["EMPLOYEE"].unique()) | (set(absences["EMPLOYEE"].unique()) if not absences.empty else set())
-    absence_daily = compute_absence_daily(absences, employee_base)
+def render_branch_body(
+    *, merged, workstation_daily, workstation_summary, daily_frame,
+    branch_id, branch_name, n_workstations_registered, fig_html,
+    workstation_filter=None, growth_note_html="",
+):
+    """Vykreslí kompletní obsah karty jedné (pod)pobočky/budovy: KPI dlaždice,
+    tabulku pracovišť, denní graf, heatmapy, týdenní rozvrh po blocích a skladbu
+    aktivit/zaměstnance. `daily_frame` (stejný tvar jako branch_daily: BRANCH_ID,
+    DATE, N_ACTIVITIES, DURATION_MIN, UTILIZATION_PCT, BUCKET) řídí KPI a denní
+    graf — u pilotní pobočky jde o efektivní (nepřítomností sníženou) kapacitu
+    jedné budovy, jinde o standardní branch_daily. `workstation_filter` (seznam
+    WORKSTATION_ID) omezí pracoviště-úrovňové pohledy na jednu budovu."""
+    ws_ids = list(workstation_filter) if workstation_filter is not None else None
 
-    absence_fig_html = (
-        fig_html(fig_absence_daily(absence_daily, branch_name, len(employee_base)))
-        if not absence_daily.empty else '<p class="note">Žádná data o nepřítomnosti pro tuto pobočku/období.</p>'
+    b_merged = merged.loc[merged["BRANCH_ID"] == branch_id]
+    merged_scope = merged
+    workstation_daily_scope = workstation_daily
+    if ws_ids is not None:
+        b_merged = b_merged.loc[b_merged["WORKSTATION_ID"].isin(ws_ids)]
+        merged_scope = merged.loc[merged["WORKSTATION_ID"].isin(ws_ids)]
+        workstation_daily_scope = workstation_daily.loc[workstation_daily["WORKSTATION_ID"].isin(ws_ids)]
+
+    if b_merged.empty:
+        return '<p class="note">Zatím žádná data pro toto pracoviště / tuto budovu.</p>'
+
+    poledni_pauza = bool(b_merged["POLEDNI_PAUZA"].iloc[0])
+
+    b_ws_summary = workstation_summary.loc[workstation_summary["BRANCH_ID"] == branch_id]
+    if ws_ids is not None:
+        b_ws_summary = b_ws_summary.loc[b_ws_summary["WORKSTATION_ID"].isin(ws_ids)]
+    b_activity_breakdown = compute_activity_breakdown(b_merged)
+    b_employee_summary = compute_employee_summary(b_merged)
+
+    n_activities = len(b_merged)
+    b_hours = b_merged["DURATION_MIN"].sum() / 60
+    b_used_ws = int(b_merged["WORKSTATION_ID"].nunique())
+
+    b_daily = daily_frame.sort_values("DATE")
+    b_activities_series = b_daily["N_ACTIVITIES"].tolist()
+    b_hours_series = (b_daily["DURATION_MIN"] / 60).tolist()
+    b_util_series = b_daily["UTILIZATION_PCT"].tolist()
+    avg_util = b_daily["UTILIZATION_PCT"].mean()
+    max_util = b_daily["UTILIZATION_PCT"].max()
+
+    kpi_html = f"""
+    <div class="card-row">
+      {_stat_tile(
+          "Celkem aktivit", f"{n_activities:,}",
+          delta_pct=_trend_delta_pct(b_activities_series), spark_values=b_activities_series, spark_color=BLUE,
+      )}
+      {_stat_tile(
+          "Celkem hodin", f"{b_hours:.1f} h",
+          delta_pct=_trend_delta_pct(b_hours_series), spark_values=b_hours_series, spark_color=CATEGORICAL[1],
+      )}
+      {_stat_tile(
+          "Průměrná vytíženost", f"{avg_util:.1f} %",
+          delta_pct=_trend_delta_pct(b_util_series), spark_values=b_util_series, spark_color=CATEGORICAL[2],
+      )}
+      {_stat_tile("Max. denní vytíženost", f"{max_util:.1f} %")}
+      {_stat_tile("Využitá / registrovaná pracoviště", f"{b_used_ws} / {n_workstations_registered}")}
+    </div>
+    """
+
+    ws_table_html = _df_to_html_table(
+        b_ws_summary.rename(columns={
+            "WORKSTATION_ID": "Pracoviště", "SEGMENT": "Segment", "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
+            "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
+            "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
+        })[["Pracoviště", "Segment", "Prům. vytíženost", "Max. vytíženost", "Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]],
+        bucket_col="Stav",
+        float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
     )
 
-    building_sections = []
-    for name, ws_range in PILOT_BUILDINGS.items():
-        b_daily = compute_building_capacity_daily(merged, branch_id, ws_range, capacity_min_per_workstation, absence_daily)
-        fig = fig_building_capacity(b_daily, name, len(list(ws_range)))
-        if fig is None:
-            building_sections.append(f"""
-        <div class="building-block">
-          <h4>{name} (pracoviště {min(ws_range)}–{max(ws_range)})</h4>
-          <p class="note">Zatím žádná data — pracoviště v této budově nejsou v evidenci aktivní.</p>
-        </div>""")
-        else:
-            building_sections.append(f"""
-        <div class="building-block">
-          <h4>{name} (pracoviště {min(ws_range)}–{max(ws_range)})</h4>
-          {fig_html(fig)}
-        </div>""")
+    daily_bar_html = fig_html(fig_branch_daily_bar(daily_frame, branch_id, branch_name)) if b_daily["DATE"].nunique() > 1 else ""
+    heatmap_html = fig_html(fig_workstation_heatmap(workstation_daily_scope, branch_id, branch_name))
+    time_profile_html = fig_html(fig_workstation_time_profile(merged_scope, daily_frame, branch_id, branch_name))
+    activity_mix_html = fig_html(fig_activity_mix(b_activity_breakdown)) if not b_activity_breakdown.empty else ""
+    employee_medals_html = _employee_medals_html(b_employee_summary)
+    weekday_progress_html = build_weekday_progress_table_html(workstation_daily_scope, branch_id)
+
+    activity_employee_block = f'''
+      <div style="margin-top:22px">{activity_mix_html}</div>
+      <div style="margin-top:22px">
+        <h3 style="margin-top:0">Nejvytíženější zaměstnanci</h3>
+        {employee_medals_html}
+      </div>'''
+
+    # --- Denní rozvrhy pracovišť po 10minutových blocích, stránkované po týdnech Po-Ne ---
+    b_daily_indexed = b_daily.set_index("DATE")
+    weeks = {}
+    for d in b_merged["DATE"].unique():
+        # d může přijít jako numpy.datetime64 (podle verze pandas) — normalizujeme
+        # na pd.Timestamp, jinak selže "in" test níže kvůli neshodě hashů mezi typy.
+        ts = pd.Timestamp(d)
+        week_start = ts - pd.Timedelta(days=ts.weekday())
+        weeks.setdefault(week_start, set()).add(ts)
+    week_starts_sorted = sorted(weeks.keys())
+    shown_week_starts = week_starts_sorted[-MAX_WEEKS_PER_BRANCH:]
+
+    weeks_note = ""
+    if len(week_starts_sorted) > MAX_WEEKS_PER_BRANCH:
+        weeks_note = (
+            f'<p class="note">Zobrazeno {MAX_WEEKS_PER_BRANCH} nejnovějších týdnů '
+            f'z celkových {len(week_starts_sorted)}.</p>'
+        )
+
+    branch_period_start = b_daily["DATE"].min()
+    branch_period_end = b_daily["DATE"].max()
+
+    week_pages = []
+    for week_idx, week_start in enumerate(shown_week_starts):
+        week_dates_with_data = weeks[week_start]
+        week_label = f"Týden {week_start:%d.%m.} – {(week_start + pd.Timedelta(days=6)):%d.%m.%Y}"
+        day_sections = []
+        for wd_offset in range(7):
+            day_date = week_start + pd.Timedelta(days=wd_offset)
+            weekday_label = WEEKDAY_LABELS[wd_offset]
+            if day_date < branch_period_start or day_date > branch_period_end:
+                # Den je mimo sledované období (ještě nenastal / není v datech) —
+                # neoznačovat jako "zavřeno", prostě ho v týdnu vynecháme.
+                continue
+            if day_date in week_dates_with_data:
+                day_row = b_daily_indexed.loc[day_date]
+                day_fig = fig_workstation_day_blocks(merged_scope, branch_id, branch_name, day_date, poledni_pauza)
+                day_sections.append(f"""
+      <div class="week-day-block">
+        <div class="week-day-heading">{weekday_label} {day_date:%d.%m.%Y} — {day_row["N_ACTIVITIES"]} aktivit,
+        {day_row["DURATION_MIN"] / 60:.1f} h, {day_row["UTILIZATION_PCT"]:.0f}% vytíženo</div>
+        {fig_html(day_fig)}
+      </div>""")
+            else:
+                day_sections.append(f"""
+      <div class="week-day-block closed">
+        <div class="week-day-heading">{weekday_label} {day_date:%d.%m.%Y} — zavřeno / bez aktivit</div>
+      </div>""")
+        if not day_sections:
+            continue
+        active_class = " active" if week_idx == len(shown_week_starts) - 1 else ""
+        week_pages.append(
+            f'<div class="week-page{active_class}" data-label="{week_label}">{"".join(day_sections)}</div>'
+        )
+
+    week_nav_id = f"weeknav-{branch_id}-{'-'.join(str(i) for i in ws_ids) if ws_ids else 'all'}"
+    default_label = week_pages and shown_week_starts and (
+        f"Týden {shown_week_starts[-1]:%d.%m.} – {(shown_week_starts[-1] + pd.Timedelta(days=6)):%d.%m.%Y}"
+    ) or "—"
+    day_blocks_html = f"""
+    <div class="week-nav-wrap" id="{week_nav_id}">
+      <div class="week-nav-controls">
+        <button class="week-prev" onclick="stepWeek(this,-1)" {"disabled" if len(shown_week_starts) <= 1 else ""}>◀ Předchozí týden</button>
+        <span class="week-label">{default_label}</span>
+        <button class="week-next" onclick="stepWeek(this,1)" disabled>Další týden ▶</button>
+      </div>
+      {"".join(week_pages) if week_pages else '<p class="note">Žádná data.</p>'}
+    </div>"""
 
     return f"""
-        <h3 style="margin-top:26px">🧪 Pilotní rozšíření: nepřítomnost a rozdělení na budovy</h3>
-        <p class="note">Základna pro výpočet % nepřítomnosti: {len(employee_base)} zaměstnanců (sjednocení jmen
-        z aktivit a z evidence nepřítomností). Nepřítomnost zahrnuje dovolenou, nemoc, home office i další typy —
-        všechny znamenají, že zaměstnanec ten den nemohl použít žádné pracoviště. Efektivní kapacita = kapacita
-        pracovišť budovy snížená o poměrný podíl nepřítomných zaměstnanců.</p>
-        {absence_fig_html}
-        {"".join(building_sections)}
+      {kpi_html}
+      {growth_note_html}
+
+      <h3>Vytíženost jednotlivých pracovišť (celé období)</h3>
+      {ws_table_html}
+
+      {"" if not daily_bar_html else f'<div style="margin-top:22px">{daily_bar_html}</div>'}
+
+      <h3 style="margin-top:26px">Průměrná vytíženost pracovišť podle dne v týdnu (Po–Ne)</h3>
+      <p class="note">Průměrná vytíženost každého pracoviště za každý den v týdnu, zprůměrovaná přes všechny
+      výskyty daného dne ve sledovaném období. Dny, kdy je pobočka zavřená, jsou označené „zavřeno".</p>
+      {weekday_progress_html}
+
+      <h3 style="margin-top:26px">Vytíženost jednotlivých pracovišť (za jednotlivé dny)</h3>
+      <div style="margin-top:6px">{heatmap_html}</div>
+
+      <h3 style="margin-top:26px">Vytíženost pracovišť podle času dne (celé období)</h3>
+      <p class="note">Stejný rastr jako denní rozvrh níže (řádek = pracoviště od nejnižšího čísla nahoře,
+      sloupec = čas dne po {BLOCK_MINUTES}minutových blocích), ale sečtený přes všechny otevřené dny ve
+      sledovaném období. Barva = v kolika % dní bylo dané pracoviště v danou dobu obsazené — od průhledné
+      (nikdy) po tmavě modrou (téměř vždy). Ukazuje tak typický denní vzorec vytížení pracoviště.</p>
+      {time_profile_html}
+
+      <h3 style="margin-top:26px">Denní rozvrh pracovišť po {BLOCK_MINUTES} minutách</h3>
+      <p class="note">Pracoviště seřazená od nejnižšího čísla nahoře, čas po ose x v blocích po
+      {BLOCK_MINUTES} minutách, barva bloku = typ aktivity. {"Šedý pás vyznačuje polední pauzu." if poledni_pauza else ""}
+      Šipkami přepínáte celý týden Po–Ne najednou — dny bez dat (zavřeno) se zobrazí jako prázdný řádek.</p>
+      {weeks_note}
+      {day_blocks_html}
+
+      {activity_employee_block}
     """
 
 
@@ -1312,59 +1469,7 @@ def build_html_report(
         </details>""")
             continue
 
-        b_merged = merged.loc[merged["BRANCH_ID"] == branch_id]
-        b_ws_summary = workstation_summary.loc[workstation_summary["BRANCH_ID"] == branch_id]
-        b_activity_breakdown = compute_activity_breakdown(b_merged)
-        b_employee_summary = compute_employee_summary(b_merged)
         b_growth = growth_by_branch.loc[branch_id] if branch_id in growth_by_branch.index else None
-        poledni_pauza = bool(b_merged["POLEDNI_PAUZA"].iloc[0])
-
-        n_activities = len(b_merged)
-        b_hours = b_merged["DURATION_MIN"].sum() / 60
-        b_used_ws = int(b_merged["WORKSTATION_ID"].nunique())
-        b_registered_ws = int(row["NO_WORKSTATIONS"])
-
-        b_daily = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id].sort_values("DATE")
-        b_activities_series = b_daily["N_ACTIVITIES"].tolist()
-        b_hours_series = (b_daily["DURATION_MIN"] / 60).tolist()
-        b_util_series = b_daily["UTILIZATION_PCT"].tolist()
-
-        kpi_html = f"""
-        <div class="card-row">
-          {_stat_tile(
-              "Celkem aktivit", f"{n_activities:,}",
-              delta_pct=_trend_delta_pct(b_activities_series), spark_values=b_activities_series, spark_color=BLUE,
-          )}
-          {_stat_tile(
-              "Celkem hodin", f"{b_hours:.1f} h",
-              delta_pct=_trend_delta_pct(b_hours_series), spark_values=b_hours_series, spark_color=CATEGORICAL[1],
-          )}
-          {_stat_tile(
-              "Průměrná vytíženost", f"{row['PRUMERNA_VYTIZENOST_PCT']:.1f} %",
-              delta_pct=_trend_delta_pct(b_util_series), spark_values=b_util_series, spark_color=CATEGORICAL[2],
-          )}
-          {_stat_tile("Max. denní vytíženost", f"{row['MAX_VYTIZENOST_PCT']:.1f} %")}
-          {_stat_tile("Využitá / registrovaná pracoviště", f"{b_used_ws} / {b_registered_ws}")}
-        </div>
-        """
-
-        ws_table_html = _df_to_html_table(
-            b_ws_summary.rename(columns={
-                "WORKSTATION_ID": "Pracoviště", "SEGMENT": "Segment", "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
-                "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
-                "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
-            })[["Pracoviště", "Segment", "Prům. vytíženost", "Max. vytíženost", "Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]],
-            bucket_col="Stav",
-            float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
-        )
-
-        daily_bar_html = fig_html(fig_branch_daily_bar(branch_daily, branch_id, branch_name)) if b_daily["DATE"].nunique() > 1 else ""
-        heatmap_html = fig_html(fig_workstation_heatmap(workstation_daily, branch_id, branch_name))
-        time_profile_html = fig_html(fig_workstation_time_profile(merged, branch_daily, branch_id, branch_name))
-        activity_mix_html = fig_html(fig_activity_mix(b_activity_breakdown)) if not b_activity_breakdown.empty else ""
-        employee_medals_html = _employee_medals_html(b_employee_summary)
-        weekday_progress_html = build_weekday_progress_table_html(workstation_daily, branch_id)
-
         growth_note_html = ""
         if b_growth is not None and bool(b_growth["PREKROCENO"]):
             growth_note_html = (
@@ -1373,89 +1478,77 @@ def build_html_report(
                 f'{int(b_growth["NO_WORKSTATIONS"])} — zvažte navýšení kapacity v evidenci.</p>'
             )
 
-        activity_employee_block = f'''
-          <div style="margin-top:22px">{activity_mix_html}</div>
-          <div style="margin-top:22px">
-            <h3 style="margin-top:0">Nejvytíženější zaměstnanci</h3>
-            {employee_medals_html}
-          </div>'''
-
-        pilot_absence_block = ""
         if branch_id == PILOT_BRANCH_ID:
-            pilot_absence_block = build_pilot_absence_section(
-                merged, branch_id, branch_name, b_merged["CAPACITY_MIN"].iloc[0],
-                absences if absences is not None else pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"]),
-                fig_html,
+            # --- Pilotní pobočka: rozdělena na dvě budovy s VLASTNÍ kapacitou
+            # (Jugoslávská 1-4, Olbrachtova 5-20 - NE 20 pracovišť dohromady) a
+            # vytíženost počítaná vůči efektivní kapacitě po odečtení nepřítomných
+            # zaměstnanců (dovolená, nemoc, home office, ...). ------------------
+            b_merged_all = merged.loc[merged["BRANCH_ID"] == branch_id]
+            absences_df = absences if absences is not None else pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
+            employee_base = set(b_merged_all["EMPLOYEE"].unique()) | (set(absences_df["EMPLOYEE"].unique()) if not absences_df.empty else set())
+            absence_daily = compute_absence_daily(absences_df, employee_base)
+            capacity_min_per_workstation = b_merged_all["CAPACITY_MIN"].iloc[0]
+
+            absence_fig_html = (
+                fig_html(fig_absence_daily(absence_daily, branch_name, len(employee_base)))
+                if not absence_daily.empty else '<p class="note">Žádná data o nepřítomnosti pro tuto pobočku/období.</p>'
             )
 
-        # --- Denní rozvrhy pracovišť po 10minutových blocích, stránkované po týdnech Po-Ne ---
-        b_daily_indexed = b_daily.set_index("DATE")
-        weeks = {}
-        for d in b_merged["DATE"].unique():
-            # d může přijít jako numpy.datetime64 (podle verze pandas) — normalizujeme
-            # na pd.Timestamp, jinak selže "in" test níže kvůli neshodě hashů mezi typy.
-            ts = pd.Timestamp(d)
-            week_start = ts - pd.Timedelta(days=ts.weekday())
-            weeks.setdefault(week_start, set()).add(ts)
-        week_starts_sorted = sorted(weeks.keys())
-        shown_week_starts = week_starts_sorted[-MAX_WEEKS_PER_BRANCH:]
+            building_bodies = []
+            n_activities_total = 0
+            b_hours_total = 0.0
+            for building_name, ws_range in PILOT_BUILDINGS.items():
+                ws_ids = list(ws_range)
+                n_ws = len(ws_ids)
+                b_daily_building = compute_pilot_building_daily(merged, branch_id, ws_ids, capacity_min_per_workstation, absence_daily)
+                b_merged_building = b_merged_all.loc[b_merged_all["WORKSTATION_ID"].isin(ws_ids)]
+                n_activities_total += len(b_merged_building)
+                b_hours_total += b_merged_building["DURATION_MIN"].sum() / 60
 
-        weeks_note = ""
-        if len(week_starts_sorted) > MAX_WEEKS_PER_BRANCH:
-            weeks_note = (
-                f'<p class="note">Zobrazeno {MAX_WEEKS_PER_BRANCH} nejnovějších týdnů '
-                f'z celkových {len(week_starts_sorted)}.</p>'
-            )
+                body_html = render_branch_body(
+                    merged=merged, workstation_daily=workstation_daily, workstation_summary=workstation_summary,
+                    daily_frame=b_daily_building, branch_id=branch_id, branch_name=f"{branch_name} — {building_name}",
+                    n_workstations_registered=n_ws, fig_html=fig_html, workstation_filter=ws_ids,
+                )
+                capacity_fig_html = ""
+                if not b_merged_building.empty:
+                    fig_cap = fig_building_capacity(b_daily_building, building_name, n_ws)
+                    if fig_cap is not None:
+                        capacity_fig_html = f'<div style="margin-top:18px">{fig_html(fig_cap)}</div>'
 
-        branch_period_start = b_daily["DATE"].min()
-        branch_period_end = b_daily["DATE"].max()
+                building_bodies.append(f"""
+        <div class="building-block">
+          <h3 style="margin-top:0">{building_name} (pracoviště {min(ws_range)}–{max(ws_range)}, {n_ws} pracovišť)</h3>
+          {capacity_fig_html}
+          {body_html}
+        </div>""")
 
-        week_pages = []
-        for week_idx, week_start in enumerate(shown_week_starts):
-            week_dates_with_data = weeks[week_start]
-            week_label = f"Týden {week_start:%d.%m.} – {(week_start + pd.Timedelta(days=6)):%d.%m.%Y}"
-            day_sections = []
-            for wd_offset in range(7):
-                day_date = week_start + pd.Timedelta(days=wd_offset)
-                weekday_label = WEEKDAY_LABELS[wd_offset]
-                if day_date < branch_period_start or day_date > branch_period_end:
-                    # Den je mimo sledované období (ještě nenastal / není v datech) —
-                    # neoznačovat jako "zavřeno", prostě ho v týdnu vynecháme.
-                    continue
-                if day_date in week_dates_with_data:
-                    day_row = b_daily_indexed.loc[day_date]
-                    day_fig = fig_workstation_day_blocks(merged, branch_id, branch_name, day_date, poledni_pauza)
-                    day_sections.append(f"""
-          <div class="week-day-block">
-            <div class="week-day-heading">{weekday_label} {day_date:%d.%m.%Y} — {day_row["N_ACTIVITIES"]} aktivit,
-            {day_row["DURATION_MIN"] / 60:.1f} h, {day_row["UTILIZATION_PCT"]:.0f}% vytíženo</div>
-            {fig_html(day_fig)}
-          </div>""")
-                else:
-                    day_sections.append(f"""
-          <div class="week-day-block closed">
-            <div class="week-day-heading">{weekday_label} {day_date:%d.%m.%Y} — zavřeno / bez aktivit</div>
-          </div>""")
-            if not day_sections:
-                continue
-            active_class = " active" if week_idx == len(shown_week_starts) - 1 else ""
-            week_pages.append(
-                f'<div class="week-page{active_class}" data-label="{week_label}">{"".join(day_sections)}</div>'
-            )
-
-        week_nav_id = f"weeknav-{branch_id}"
-        default_label = week_pages and shown_week_starts and (
-            f"Týden {shown_week_starts[-1]:%d.%m.} – {(shown_week_starts[-1] + pd.Timedelta(days=6)):%d.%m.%Y}"
-        ) or "—"
-        day_blocks_html = f"""
-        <div class="week-nav-wrap" id="{week_nav_id}">
-          <div class="week-nav-controls">
-            <button class="week-prev" onclick="stepWeek(this,-1)" {"disabled" if len(shown_week_starts) <= 1 else ""}>◀ Předchozí týden</button>
-            <span class="week-label">{default_label}</span>
-            <button class="week-next" onclick="stepWeek(this,1)" disabled>Další týden ▶</button>
+            branch_blocks.append(f"""
+        <details class="branch-block">
+          <summary>{branch_name} ({branch_id})
+            <span class="branch-summary-line">2 budovy · {b_hours_total:.0f} h · {n_activities_total} aktivit</span>
+          </summary>
+          <div class="branch-body">
+          {growth_note_html}
+          <p class="note">🧪 Pilotní pobočka: rozdělená na dvě budovy s vlastní kapacitou (viz níže), vytíženost je
+          počítána vůči efektivní kapacitě po odečtení nepřítomných zaměstnanců — dovolená, nemoc, home office a
+          další typy nepřítomnosti (základna {len(employee_base)} zaměstnanců, sjednocení jmen z aktivit a evidence
+          nepřítomností).</p>
+          {absence_fig_html}
+          {"".join(building_bodies)}
           </div>
-          {"".join(week_pages) if week_pages else '<p class="note">Žádná data.</p>'}
-        </div>"""
+        </details>""")
+            continue
+
+        b_daily = branch_daily.loc[branch_daily["BRANCH_ID"] == branch_id]
+        n_activities = len(merged.loc[merged["BRANCH_ID"] == branch_id])
+        b_hours = merged.loc[merged["BRANCH_ID"] == branch_id, "DURATION_MIN"].sum() / 60
+        body_html = render_branch_body(
+            merged=merged, workstation_daily=workstation_daily, workstation_summary=workstation_summary,
+            daily_frame=b_daily, branch_id=branch_id, branch_name=branch_name,
+            n_workstations_registered=int(row["NO_WORKSTATIONS"]), fig_html=fig_html,
+            growth_note_html=growth_note_html,
+        )
 
         branch_blocks.append(f"""
         <details class="branch-block">
@@ -1463,38 +1556,7 @@ def build_html_report(
             <span class="branch-summary-line">{row['PRUMERNA_VYTIZENOST_PCT']:.0f}% vytíženo · {b_hours:.0f} h · {n_activities} aktivit</span>
           </summary>
           <div class="branch-body">
-          {kpi_html}
-          {growth_note_html}
-
-          <h3>Vytíženost jednotlivých pracovišť (celé období)</h3>
-          {ws_table_html}
-
-          {"" if not daily_bar_html else f'<div style="margin-top:22px">{daily_bar_html}</div>'}
-
-          <h3 style="margin-top:26px">Průměrná vytíženost pracovišť podle dne v týdnu (Po–Ne)</h3>
-          <p class="note">Průměrná vytíženost každého pracoviště za každý den v týdnu, zprůměrovaná přes všechny
-          výskyty daného dne ve sledovaném období. Dny, kdy je pobočka zavřená, jsou označené „zavřeno".</p>
-          {weekday_progress_html}
-
-          <h3 style="margin-top:26px">Vytíženost jednotlivých pracovišť (za jednotlivé dny)</h3>
-          <div style="margin-top:6px">{heatmap_html}</div>
-
-          <h3 style="margin-top:26px">Vytíženost pracovišť podle času dne (celé období)</h3>
-          <p class="note">Stejný rastr jako denní rozvrh níže (řádek = pracoviště od nejnižšího čísla nahoře,
-          sloupec = čas dne po {BLOCK_MINUTES}minutových blocích), ale sečtený přes všechny otevřené dny ve
-          sledovaném období. Barva = v kolika % dní bylo dané pracoviště v danou dobu obsazené — od průhledné
-          (nikdy) po tmavě modrou (téměř vždy). Ukazuje tak typický denní vzorec vytížení pracoviště.</p>
-          {time_profile_html}
-
-          <h3 style="margin-top:26px">Denní rozvrh pracovišť po {BLOCK_MINUTES} minutách</h3>
-          <p class="note">Pracoviště seřazená od nejnižšího čísla nahoře, čas po ose x v blocích po
-          {BLOCK_MINUTES} minutách, barva bloku = typ aktivity. {"Šedý pás vyznačuje polední pauzu." if poledni_pauza else ""}
-          Šipkami přepínáte celý týden Po–Ne najednou — dny bez dat (zavřeno) se zobrazí jako prázdný řádek.</p>
-          {weeks_note}
-          {day_blocks_html}
-
-          {activity_employee_block}
-          {pilot_absence_block}
+          {body_html}
           </div>
         </details>""")
 
@@ -1569,7 +1631,7 @@ function stepWeek(btn, delta) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-14d (oprava: text z .xlsx se normalizuje na NFC - rozložená diakritika v exportu bránila napárování sloupců)"
+SCRIPT_VERSION = "2026-07-15 (pobočka Jugoslávská plně přepočítaná po budovách - 16 vs. 4 pracovišť, vytíženost vůči efektivní kapacitě po odečtení nepřítomnosti)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
