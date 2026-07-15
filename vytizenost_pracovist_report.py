@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 import unicodedata
 import zipfile
@@ -50,14 +49,6 @@ THRESHOLD_CRITICAL = 90.0  # od této hranice (%) je pracoviště "kriticky vyt�
 # sloupcem VIKENDOVA z work_spaces.xlsx; denní kapacita = týdenní CAPACITY / počet dní.
 DAYS_PER_WEEK_OPEN = 5
 DAYS_PER_WEEK_OPEN_WEEKEND = 7
-
-# Polední pauza (pokud POLEDNI_PAUZA=True u pobočky) — vizuálně vyznačena v denním
-# rozvrhu pracovišť; přesný čas neznáme ze zdrojových dat, proto je zde jako konstanta.
-LUNCH_BREAK_START_HOUR = 12
-LUNCH_BREAK_END_HOUR = 13
-
-BLOCK_MINUTES = 10  # velikost bloku pro denní rozvrh pracovišť
-MAX_WEEKS_PER_BRANCH = 26  # bezpečnostní strop počtu týdnů v přepínači denních rozvrhů (nejnovější týdny mají přednost)
 
 # --- Pilotní rozšíření (jen pobočka Praha 2 - Jugoslávská) -------------------
 # Nepřítomnost zaměstnanců (dovolená, nemoc, home office, ...) se z evidence počítá
@@ -755,6 +746,87 @@ def build_granularity_switcher_html(merged_scope, daily_frame, branch_id, branch
     </div>"""
 
 
+def compute_workstation_period_series(workstation_daily_scope, branch_id, granularity):
+    """Pro KAŽDÉ pracoviště pobočky/budovy vrátí chronologickou řadu (popisek, %)
+    agregovanou na zvolené úrovni (dny/týdny/měsíce). Kapacita jednoho pracoviště
+    je v rámci pobočky konstantní napříč dny, takže vážený součet
+    (odpracované minuty / kapacita) je totéž jako průměr denních %."""
+    d = workstation_daily_scope.loc[workstation_daily_scope["BRANCH_ID"] == branch_id].copy()
+    if d.empty:
+        return {}
+
+    if granularity == "days":
+        d["GROUP_KEY"] = d["DATE"]
+        label_fmt = "%d.%m."
+    elif granularity == "weeks":
+        d["GROUP_KEY"] = d["DATE"] - pd.to_timedelta(d["DATE"].dt.weekday, unit="D")
+        label_fmt = "%d.%m."
+    elif granularity == "months":
+        d["GROUP_KEY"] = d["DATE"].dt.to_period("M").dt.to_timestamp()
+        label_fmt = "%m/%Y"
+    else:
+        raise ValueError(f"Neznámá granularita: {granularity}")
+
+    out = {}
+    for ws_id, g in d.groupby("WORKSTATION_ID"):
+        grouped = (
+            g.groupby("GROUP_KEY").agg(DURATION_MIN=("DURATION_MIN", "sum"), CAPACITY_MIN=("CAPACITY_MIN", "sum"))
+            .reset_index().sort_values("GROUP_KEY")
+        )
+        grouped["UTILIZATION_PCT"] = np.where(grouped["CAPACITY_MIN"] > 0, grouped["DURATION_MIN"] / grouped["CAPACITY_MIN"] * 100, np.nan)
+        grouped["LABEL"] = grouped["GROUP_KEY"].dt.strftime(label_fmt)
+        out[int(ws_id)] = list(zip(grouped["LABEL"], grouped["UTILIZATION_PCT"]))
+    return out
+
+
+def _mini_progress_html(label, pct, color):
+    fill_pct = min(100, max(0, pct)) if pd.notna(pct) else 0
+    pct_label = f"{pct:.0f}%" if pd.notna(pct) else "—"
+    return f"""<div class="wsprog-item" title="{label}: {pct_label}">
+      <div class="wsprog-track"><div class="wsprog-fill" style="width:{fill_pct:.0f}%; background:{color}"></div></div>
+      <div class="wsprog-label">{label}</div>
+    </div>"""
+
+
+_WS_PROGRESS_GRANULARITY_LABELS = [("days", "Dny"), ("weeks", "Týdny"), ("months", "Měsíce")]
+
+
+def build_workstation_progress_html(workstation_daily_scope, branch_id, container_id):
+    """Blok po pracovištích — každé pracoviště má vlastní řadu progress barů
+    naplněných dle vytíženosti, s přepínačem granularity Dny/Týdny/Měsíce (žádné
+    stránkování po týdnech, jen přepnutí úrovně agregace)."""
+    ws_ids = sorted(workstation_daily_scope.loc[workstation_daily_scope["BRANCH_ID"] == branch_id, "WORKSTATION_ID"].unique())
+    if not ws_ids:
+        return '<p class="note">Žádná data.</p>'
+
+    pages, buttons = [], []
+    for key, cz_label in _WS_PROGRESS_GRANULARITY_LABELS:
+        series_by_ws = compute_workstation_period_series(workstation_daily_scope, branch_id, key)
+        blocks = []
+        for ws_id in ws_ids:
+            items = series_by_ws.get(int(ws_id), [])
+            bars = "".join(
+                _mini_progress_html(label, pct, BUCKET_COLORS.get(utilization_bucket(pct), STATUS_MUTED))
+                for label, pct in items
+            )
+            blocks.append(f"""
+      <div class="ws-block">
+        <h4>Pracoviště {ws_id}</h4>
+        <div class="ws-bar-row">{bars if bars else '<p class="note">Žádná data.</p>'}</div>
+      </div>""")
+        active = key == "days"
+        pages.append(f'<div class="gran-page{" active" if active else ""}" data-key="{key}">{"".join(blocks)}</div>')
+        buttons.append(
+            f'<button class="gran-btn{" active" if active else ""}" data-key="{key}" '
+            f'onclick="stepGranularity(this,\'{key}\')">{cz_label}</button>'
+        )
+    return f"""
+    <div class="gran-wrap" id="{container_id}">
+      <div class="gran-controls">{"".join(buttons)}</div>
+      {"".join(pages)}
+    </div>"""
+
+
 # --- Pilotní rozšíření: nepřítomnost zaměstnanců a rozdělení na budovy ------
 
 def compute_pilot_building_daily(merged, branch_id, workstation_range, capacity_min_per_workstation, absence_daily):
@@ -1051,101 +1123,6 @@ def build_branch_overview_table_html(front_page_summary):
     </table>"""
 
 
-def _discrete_colorscale(colors):
-    """Vrátí Plotly colorscale, kde celočíselná hodnota z=i (i=0..len(colors)-1)
-    vždy vyjde přesně na barvu colors[i] — pro "kategoriální" heatmapu."""
-    n = len(colors)
-    scale = []
-    for i, color in enumerate(colors):
-        scale.append([i / n, color])
-        scale.append([(i + 1) / n, color])
-    return scale
-
-
-def fig_workstation_week_blocks(merged, branch_id, branch_name, week_start, poledni_pauza, block_minutes=BLOCK_MINUTES):
-    """Rozvrh pracovišť za CELÝ týden (Po–Ne) v JEDNÉ heatmapě — dny vedle sebe
-    oddělené svislou čárou, řádky jsou pracoviště (od nejmenšího čísla nahoře),
-    barva bloku = typ aktivity. Čitelnější náhrada za 7 samostatných grafů (jeden
-    na den). Polední pauza (pokud POLEDNI_PAUZA=True) je vyznačená šedým pásem
-    v každém dni zvlášť."""
-    d_branch = merged.loc[merged["BRANCH_ID"] == branch_id]
-    ws_ids = sorted(d_branch["WORKSTATION_ID"].unique())
-    week_dates = [week_start + pd.Timedelta(days=i) for i in range(7)]
-    d_week = d_branch.loc[d_branch["DATE"].isin(week_dates)].copy()
-    if not ws_ids or d_week.empty:
-        return None
-
-    d_week["TOD_START"] = d_week["DATETIME"].dt.hour * 60 + d_week["DATETIME"].dt.minute
-    d_week["TOD_END"] = d_week["TOD_START"] + d_week["DURATION_MIN"]
-    day_start_min = int(np.floor(d_week["TOD_START"].min() / block_minutes) * block_minutes)
-    day_end_min = int(np.ceil(d_week["TOD_END"].max() / block_minutes) * block_minutes)
-    if day_end_min - day_start_min < 120:
-        day_end_min = day_start_min + 120
-    n_blocks_per_day = (day_end_min - day_start_min) // block_minutes
-
-    activities_present = sorted(d_week["ACTIVITY"].unique())
-    activity_code = {a: i + 1 for i, a in enumerate(activities_present)}
-    activity_color = {a: CATEGORICAL[i % len(CATEGORICAL)] for i, a in enumerate(activities_present)}
-    colors = [GRIDLINE] + [activity_color[a] for a in activities_present]
-
-    ws_row = {ws: i for i, ws in enumerate(ws_ids)}
-    total_cols = 7 * n_blocks_per_day
-    z = np.zeros((len(ws_ids), total_cols))
-    hover = np.full((len(ws_ids), total_cols), "", dtype=object)
-
-    for day_i, day_date in enumerate(week_dates):
-        col0 = day_i * n_blocks_per_day
-        day_data = d_week.loc[d_week["DATE"] == day_date]
-        for r in day_data.itertuples(index=False):
-            row_i = ws_row[r.WORKSTATION_ID]
-            c0 = max(0, int((r.TOD_START - day_start_min) // block_minutes))
-            c1 = min(n_blocks_per_day, math.ceil((r.TOD_END - day_start_min) / block_minutes))
-            code = activity_code[r.ACTIVITY]
-            label = f"{r.ACTIVITY}<br>{r.EMPLOYEE}<br>{WEEKDAY_LABELS[day_i]} {day_date:%d.%m.}"
-            for c in range(c0, c1):
-                z[row_i, col0 + c] = code
-                hover[row_i, col0 + c] = label
-
-    fig = go.Figure(go.Heatmap(
-        z=z, y=[f"Prac. {w}" for w in ws_ids],
-        zmin=0, zmax=len(colors), colorscale=_discrete_colorscale(colors), showscale=False,
-        text=hover, hoverinfo="text", xgap=0.5, ygap=2,
-    ))
-
-    if poledni_pauza:
-        lunch_c0 = (LUNCH_BREAK_START_HOUR * 60 - day_start_min) / block_minutes
-        lunch_c1 = (LUNCH_BREAK_END_HOUR * 60 - day_start_min) / block_minutes
-        if lunch_c1 > 0 and lunch_c0 < n_blocks_per_day:
-            for day_i in range(7):
-                col0 = day_i * n_blocks_per_day
-                fig.add_vrect(
-                    x0=col0 + max(0.0, lunch_c0) - 0.5, x1=col0 + min(n_blocks_per_day, lunch_c1) - 0.5,
-                    fillcolor=TEXT_MUTED, opacity=0.18, line_width=0,
-                )
-
-    for day_i in range(1, 7):
-        fig.add_vline(x=day_i * n_blocks_per_day - 0.5, line_color=TEXT_MUTED, line_width=1.5)
-
-    tick_vals = [day_i * n_blocks_per_day + n_blocks_per_day / 2 - 0.5 for day_i in range(7)]
-    tick_text = [f"{WEEKDAY_LABELS[i]} {d:%d.%m.}" for i, d in enumerate(week_dates)]
-
-    # heatmapa nemá vlastní kategoriální legendu -> "fantomové" body jen pro popisky v legendě
-    for a in activities_present:
-        fig.add_trace(go.Scatter(
-            x=[0], y=[f"Prac. {ws_ids[0]}"], mode="markers",
-            marker=dict(size=0.001, color=activity_color[a]), name=a, showlegend=True, hoverinfo="skip",
-        ))
-
-    fig.update_yaxes(autorange="reversed", title=None)
-    fig.update_xaxes(title=None, tickmode="array", tickvals=tick_vals, ticktext=tick_text)
-    fig.update_layout(
-        title=f"{branch_name} — týden {week_dates[0]:%d.%m.} – {week_dates[-1]:%d.%m.%Y}",
-        height=max(240, 30 * len(ws_ids) + 160),
-        legend_title_text="Aktivita",
-    )
-    return _style_chart(fig, legend=True)
-
-
 # -----------------------------------------------------------------------------
 # 6. Sestavení HTML reportu
 # -----------------------------------------------------------------------------
@@ -1224,8 +1201,7 @@ footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px
 .building-block { margin-top: 18px; padding: 14px 16px; border: 1px solid #e1e0d9; border-radius: 10px; }
 .building-block h4 { margin: 0 0 6px 0; font-size: 14px; }
 
-/* Přepínač týdnů (denní rozvrh po blocích) */
-.week-nav-wrap { margin-top: 10px; }
+/* Ovládací prvky přepínače měsíců (sdíleno s kalendářním přehledem) */
 .week-nav-controls { display: flex; align-items: center; justify-content: center; gap: 14px; margin-bottom: 12px; }
 .week-nav-controls button {
     font-size: 13px; padding: 7px 14px; border-radius: 18px; border: 1px solid #c3c2b7;
@@ -1234,8 +1210,6 @@ footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px
 .week-nav-controls button:disabled { opacity: 0.35; cursor: default; }
 .week-nav-controls button:not(:disabled):hover { background: #f0efec; }
 .week-label { font-weight: 600; font-size: 13.5px; min-width: 200px; text-align: center; }
-.week-page { display: none; }
-.week-page.active { display: block; }
 
 /* Přepínač granularity (Hodiny/Dny/Týdny/Měsíce) */
 .gran-controls { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
@@ -1247,6 +1221,15 @@ footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px
 .gran-btn.active { background: #0b0b0b; color: #fcfcfb; border-color: #0b0b0b; }
 .gran-page { display: none; }
 .gran-page.active { display: block; }
+
+/* Vytíženost pracovišť v čase — blok progress barů po pracovištích */
+.ws-block { margin-bottom: 20px; }
+.ws-block h4 { margin: 0 0 8px 0; font-size: 13px; }
+.ws-bar-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.wsprog-item { display: flex; flex-direction: column; gap: 3px; width: 54px; }
+.wsprog-track { height: 10px; border-radius: 5px; background: #e1e0d9; overflow: hidden; }
+.wsprog-fill { height: 100%; border-radius: 5px; }
+.wsprog-label { font-size: 9px; color: #898781; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* Kalendářní přehled (titulní strana) */
 .month-nav-wrap { margin-top: 10px; }
@@ -1364,29 +1347,30 @@ WEEKDAY_LABELS = ["Po", "Út", "St", "Čt", "Pá", "So", "Ne"]
 
 
 def render_branch_body(
-    *, merged, workstation_summary, daily_frame,
+    *, merged, workstation_daily, workstation_summary, daily_frame,
     branch_id, branch_name, n_workstations_registered, fig_html,
     workstation_filter=None, growth_note_html="",
 ):
     """Vykreslí kompletní obsah karty jedné (pod)pobočky/budovy: KPI dlaždice,
-    tabulku pracovišť, agregovanou vytíženost v čase, týdenní rozvrh po blocích a
-    skladbu aktivit/zaměstnance. `daily_frame` (stejný tvar jako branch_daily:
-    BRANCH_ID, DATE, N_ACTIVITIES, DURATION_MIN, UTILIZATION_PCT, BUCKET) řídí KPI
-    a graf v čase — u pilotní pobočky jde o efektivní (nepřítomností sníženou)
-    kapacitu jedné budovy, jinde o standardní branch_daily. `workstation_filter`
-    (seznam WORKSTATION_ID) omezí pracoviště-úrovňové pohledy na jednu budovu."""
+    tabulku pracovišť, agregovanou vytíženost v čase, blok progress barů po
+    pracovištích a skladbu aktivit/zaměstnance. `daily_frame` (stejný tvar jako
+    branch_daily: BRANCH_ID, DATE, N_ACTIVITIES, DURATION_MIN, UTILIZATION_PCT,
+    BUCKET) řídí KPI a graf v čase — u pilotní pobočky jde o efektivní
+    (nepřítomností sníženou) kapacitu jedné budovy, jinde o standardní
+    branch_daily. `workstation_filter` (seznam WORKSTATION_ID) omezí
+    pracoviště-úrovňové pohledy na jednu budovu."""
     ws_ids = list(workstation_filter) if workstation_filter is not None else None
 
     b_merged = merged.loc[merged["BRANCH_ID"] == branch_id]
     merged_scope = merged
+    workstation_daily_scope = workstation_daily
     if ws_ids is not None:
         b_merged = b_merged.loc[b_merged["WORKSTATION_ID"].isin(ws_ids)]
         merged_scope = merged.loc[merged["WORKSTATION_ID"].isin(ws_ids)]
+        workstation_daily_scope = workstation_daily.loc[workstation_daily["WORKSTATION_ID"].isin(ws_ids)]
 
     if b_merged.empty:
         return '<p class="note">Zatím žádná data pro toto pracoviště / tuto budovu.</p>'
-
-    poledni_pauza = bool(b_merged["POLEDNI_PAUZA"].iloc[0])
 
     b_ws_summary = workstation_summary.loc[workstation_summary["BRANCH_ID"] == branch_id]
     if ws_ids is not None:
@@ -1446,57 +1430,8 @@ def render_branch_body(
         {employee_medals_html}
       </div>'''
 
-    # --- Denní rozvrh pracovišť po 10minutových blocích, jedna heatmapa za celý týden, stránkované po týdnech Po-Ne ---
-    weeks = {}
-    for d in b_merged["DATE"].unique():
-        # d může přijít jako numpy.datetime64 (podle verze pandas) — normalizujeme
-        # na pd.Timestamp, jinak selže "in" test níže kvůli neshodě hashů mezi typy.
-        ts = pd.Timestamp(d)
-        week_start = ts - pd.Timedelta(days=ts.weekday())
-        weeks.setdefault(week_start, set()).add(ts)
-    week_starts_sorted = sorted(weeks.keys())
-    shown_week_starts = week_starts_sorted[-MAX_WEEKS_PER_BRANCH:]
-
-    weeks_note = ""
-    if len(week_starts_sorted) > MAX_WEEKS_PER_BRANCH:
-        weeks_note = (
-            f'<p class="note">Zobrazeno {MAX_WEEKS_PER_BRANCH} nejnovějších týdnů '
-            f'z celkových {len(week_starts_sorted)}.</p>'
-        )
-
-    week_pages = []
-    for week_idx, week_start in enumerate(shown_week_starts):
-        week_dates = [week_start + pd.Timedelta(days=i) for i in range(7)]
-        week_label = f"Týden {week_start:%d.%m.} – {(week_start + pd.Timedelta(days=6)):%d.%m.%Y}"
-        week_daily = b_daily.loc[b_daily["DATE"].isin(week_dates)]
-        if week_daily.empty:
-            continue
-        week_fig = fig_workstation_week_blocks(merged_scope, branch_id, branch_name, week_start, poledni_pauza)
-        content = fig_html(week_fig) if week_fig is not None else '<p class="note">Žádná data.</p>'
-        summary_line = (
-            f'{int(week_daily["N_ACTIVITIES"].sum())} aktivit, {week_daily["DURATION_MIN"].sum() / 60:.1f} h, '
-            f'{week_daily["UTILIZATION_PCT"].mean():.0f} % průměrná vytíženost'
-        )
-        active_class = " active" if week_idx == len(shown_week_starts) - 1 else ""
-        week_pages.append(f"""
-      <div class="week-page{active_class}" data-label="{week_label}">
-        <p class="note">{summary_line}</p>
-        {content}
-      </div>""")
-
-    week_nav_id = f"weeknav-{branch_id}-{'-'.join(str(i) for i in ws_ids) if ws_ids else 'all'}"
-    default_label = week_pages and shown_week_starts and (
-        f"Týden {shown_week_starts[-1]:%d.%m.} – {(shown_week_starts[-1] + pd.Timedelta(days=6)):%d.%m.%Y}"
-    ) or "—"
-    day_blocks_html = f"""
-    <div class="week-nav-wrap" id="{week_nav_id}">
-      <div class="week-nav-controls">
-        <button class="week-prev" onclick="stepWeek(this,-1)" {"disabled" if len(shown_week_starts) <= 1 else ""}>◀ Předchozí týden</button>
-        <span class="week-label">{default_label}</span>
-        <button class="week-next" onclick="stepWeek(this,1)" disabled>Další týden ▶</button>
-      </div>
-      {"".join(week_pages) if week_pages else '<p class="note">Žádná data.</p>'}
-    </div>"""
+    ws_progress_container_id = f"wsprog-{branch_id}-{'-'.join(str(i) for i in ws_ids) if ws_ids else 'all'}"
+    ws_progress_html = build_workstation_progress_html(workstation_daily_scope, branch_id, ws_progress_container_id)
 
     return f"""
       {kpi_html}
@@ -1510,12 +1445,10 @@ def render_branch_body(
       průměrný denní vzorec (kolik % kapacity dané hodiny se v průměru využije) za celé sledované období.</p>
       {gran_switcher_html}
 
-      <h3 style="margin-top:26px">Denní rozvrh pracovišť po {BLOCK_MINUTES} minutách</h3>
-      <p class="note">Jedna heatmapa za celý týden — dny Po–Ne vedle sebe oddělené svislou čárou, pracoviště
-      seřazená od nejnižšího čísla nahoře, barva bloku = typ aktivity. {"Šedý pás vyznačuje polední pauzu." if poledni_pauza else ""}
-      Šipkami přepínáte mezi týdny.</p>
-      {weeks_note}
-      {day_blocks_html}
+      <h3 style="margin-top:26px">Vytíženost pracovišť v čase</h3>
+      <p class="note">Blok pro každé pracoviště zvlášť — progress bar naplněný podle vytíženosti vůči kapacitě.
+      Přepínač Dny/Týdny/Měsíce mění úroveň agregace (bez stránkování po týdnech).</p>
+      {ws_progress_html}
 
       {activity_employee_block}
     """
@@ -1651,7 +1584,7 @@ def build_html_report(
                         capacity_fig_html = f'<div style="margin-top:18px">{fig_html(fig_cap)}</div>'
 
                 body_html = render_branch_body(
-                    merged=merged, workstation_summary=workstation_summary,
+                    merged=merged, workstation_daily=workstation_daily, workstation_summary=workstation_summary,
                     daily_frame=b_daily_building, branch_id=branch_id, branch_name=f"{branch_name} — {building_name}",
                     n_workstations_registered=n_ws, fig_html=fig_html, workstation_filter=ws_ids,
                 )
@@ -1684,7 +1617,7 @@ def build_html_report(
         n_activities = len(merged.loc[merged["BRANCH_ID"] == branch_id])
         b_hours = merged.loc[merged["BRANCH_ID"] == branch_id, "DURATION_MIN"].sum() / 60
         body_html = render_branch_body(
-            merged=merged, workstation_summary=workstation_summary,
+            merged=merged, workstation_daily=workstation_daily, workstation_summary=workstation_summary,
             daily_frame=b_daily, branch_id=branch_id, branch_name=branch_name,
             n_workstations_registered=int(row["NO_WORKSTATIONS"]), fig_html=fig_html,
             growth_note_html=growth_note_html,
@@ -1742,26 +1675,14 @@ def build_html_report(
   <div class="section">
     <h2>Detail pobočky</h2>
     <p class="note">Rozklikněte pobočku (nebo na ni klikněte v přehledu výše) — uvidíte vytíženost jejích
-    pracovišť za celé období i po jednotlivých dnech, agregaci vytíženosti podle hodin/dnů/týdnů/měsíců, denní
-    rozvrh pracovišť po {BLOCK_MINUTES} minutách a skladbu aktivit se zaměstnanci.</p>
+    pracovišť za celé období i po jednotlivých dnech, agregaci vytíženosti podle hodin/dnů/týdnů/měsíců,
+    vytíženost jednotlivých pracovišť v čase a skladbu aktivit se zaměstnanci.</p>
     {branch_blocks_html}
   </div>
 
 </div>
 <footer>Report vygenerován automaticky z bo_data.xlsx a work_spaces.xlsx.</footer>
 <script>
-function stepWeek(btn, delta) {{
-  var wrap = btn.closest('.week-nav-wrap');
-  var pages = wrap.querySelectorAll('.week-page');
-  var cur = 0;
-  pages.forEach(function(p, i) {{ if (p.classList.contains('active')) cur = i; }});
-  var next = Math.max(0, Math.min(pages.length - 1, cur + delta));
-  pages.forEach(function(p, i) {{ p.classList.toggle('active', i === next); }});
-  wrap.querySelector('.week-label').textContent = pages[next].dataset.label;
-  wrap.querySelector('.week-prev').disabled = (next === 0);
-  wrap.querySelector('.week-next').disabled = (next === pages.length - 1);
-}}
-
 function stepMonth(btn, delta) {{
   var wrap = btn.closest('.month-nav-wrap');
   var pages = wrap.querySelectorAll('.month-page');
@@ -1805,7 +1726,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-16c (oprava: graf efektivní kapacity u pilotní pobočky se nevykresloval - Plotly.js knihovna se v DOM načítala až po skriptu, co ji potřeboval)"
+SCRIPT_VERSION = "2026-07-17 (denní rozvrh po 10 minutách nahrazen blokem progress barů po pracovištích, granularita Dny/Týdny/Měsíce, bez stránkování po týdnech)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
