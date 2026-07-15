@@ -346,16 +346,31 @@ def load_segments(path, sheet_name=SEGMENTS_SHEET_NAME):
     return df.reset_index(drop=True)
 
 
+ABSENCE_TYPES_COUNTED = [
+    "Dovolená - hodiny (0500)",
+    "Home office (0161)",
+    "Zdravotní volno (0152)",
+    "Můj den (0571)",
+    "Nemoc (0205)",
+    "Home office 1/2 dne (0162)",
+]
+ABSENCE_STATUS_COUNTED = "APPROVED"
+
+
 def load_absences(path, org_unit_zkratka):
     """Načte export nepřítomností z HR systému (Nepřítomnosti.xlsx). Před hlavičkou
     bývá pár řádků metadat ("Exportováno do formátu Excel dne...") - jejich přesný
     počet se mezi exporty může lišit, proto se řádek s hlavičkou hledá automaticky
-    (první řádek obsahující 'Příjmení'), místo pevného skiprows. Filtruje jen na
-    `org_unit_zkratka` (pilotní pobočka) a vrátí denní tabulku EMPLOYEE×DATE s
-    podílem dne (ABSENCE_FRACTION, 0-1), kdy zaměstnanec nebyl k dispozici - v tomto
-    exportu KAŽDÝ typ nepřítomnosti (dovolená, nemoc, home office, ...) znamená, že
-    ten den nemohl použít žádné pracoviště."""
-    needed = ["Příjmení", "Jméno", "Zkratka organizační jednotky", "Začátek - datum", "Konec - datum", "Počet dní"]
+    (první řádek obsahující 'Příjmení'), místo pevného skiprows. Filtruje na
+    `org_unit_zkratka` (pilotní pobočka), na typy nepřítomnosti z
+    ABSENCE_TYPES_COUNTED a na stav žádosti ABSENCE_STATUS_COUNTED (schválené) -
+    ostatní typy (např. náhrada mzdy) ani neschválené žádosti se nepočítají. Vrátí
+    denní tabulku EMPLOYEE×DATE s podílem dne (ABSENCE_FRACTION, 0-1), kdy
+    zaměstnanec nebyl k dispozici a nemohl použít žádné pracoviště."""
+    needed = [
+        "Příjmení", "Jméno", "Zkratka organizační jednotky", "Začátek - datum", "Konec - datum",
+        "Počet dní", "Typ nepřítomnosti", "Stav žádosti",
+    ]
     try:
         rows = read_xlsx_rows(path)
     except (FileNotFoundError, zipfile.BadZipFile):
@@ -372,7 +387,11 @@ def load_absences(path, org_unit_zkratka):
     if missing:
         raise ValueError(f"V souboru {path} chybí očekávané sloupce: {missing}")
 
-    df = raw.loc[raw["Zkratka organizační jednotky"] == org_unit_zkratka].copy()
+    df = raw.loc[
+        (raw["Zkratka organizační jednotky"] == org_unit_zkratka)
+        & (raw["Typ nepřítomnosti"].isin(ABSENCE_TYPES_COUNTED))
+        & (raw["Stav žádosti"] == ABSENCE_STATUS_COUNTED)
+    ].copy()
     if df.empty:
         return pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
 
@@ -989,7 +1008,10 @@ def build_combined_daily_calendar_data(branch_daily, merged, absences):
         if total > 0:
             activity_mix_by_date[date] = (g.groupby("ACTIVITY")["DURATION_MIN"].sum() / total * 100).sort_values(ascending=False).to_dict()
 
-    return daily.sort_values("DATE").reset_index(drop=True), activity_mix_by_date
+    absences_df = absences if absences is not None else pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
+    absence_count_by_date = absences_df.groupby("DATE").size().to_dict() if not absences_df.empty else {}
+
+    return daily.sort_values("DATE").reset_index(drop=True), activity_mix_by_date, absence_count_by_date
 
 
 MONTH_NAMES = [
@@ -1017,19 +1039,20 @@ def _short_activity_label(name, max_len=9):
     return name if len(name) <= max_len else name[:max_len - 1] + "…"
 
 
-def build_month_calendar_html(daily_combined, activity_mix_by_date):
+def build_month_calendar_html(daily_combined, activity_mix_by_date, absence_count_by_date):
     """Kalendářový přehled: dny vybraného měsíce v mřížce Po–Ne, sytost zelené =
-    kombinovaná vytíženost všech poboček dohromady. V každém boxíku navíc počet
-    obsazených pracovišť a % rozložení typů aktivit ten den. Barva textu se volí
-    podle světlosti pozadí. Měsíce se přepínají šipkami (stejný vzor jako týdenní
-    navigátor u denního rozvrhu pracovišť)."""
+    kombinovaná vytíženost všech poboček dohromady. Barva je škálovaná vůči
+    ABSOLUTNÍ hranici THRESHOLD_CRITICAL (ne vůči pozorovanému maximu) - jinak by
+    i nízké vytížení, které náhodou vyjde jako nejvyšší pozorovaná hodnota, vyšlo
+    jako plně tmavé. V každém boxíku navíc počet obsazených pracovišť, % rozložení
+    typů aktivit a (pokud jsou toho dne nějaké) emotikon nemocného + počet
+    nepřítomností. Barva textu se volí podle světlosti pozadí. Měsíce se přepínají
+    šipkami (stejný vzor jako týdenní navigátor u denního rozvrhu pracovišť)."""
     valid = daily_combined.dropna(subset=["UTILIZATION_PCT"])
     if valid.empty:
         return '<p class="note">Žádná data pro kalendářový přehled.</p>'
 
     daily_indexed = daily_combined.set_index("DATE")
-    max_pct = valid["UTILIZATION_PCT"].max()
-    max_pct = max_pct if max_pct > 0 else 100.0
 
     months = sorted({(d.year, d.month) for d in daily_combined["DATE"]})
     weekday_header = "".join(f"<div class='cal-weekday'>{lbl}</div>" for lbl in WEEKDAY_LABELS)
@@ -1052,17 +1075,22 @@ def build_month_calendar_html(daily_combined, activity_mix_by_date):
             elif row is None or pd.isna(pct):
                 cells.append(f'<div class="cal-cell muted" title="{d:%d.%m.%Y} — bez dat"><span class="cal-day">{d.day}</span></div>')
             else:
-                bg, text_color = _green_shade(pct / max_pct)
+                bg, text_color = _green_shade(pct / THRESHOLD_CRITICAL)
                 n_ws = int(row["N_WORKSTATIONS_OCCUPIED"])
                 mix = activity_mix_by_date.get(d, {})
                 mix_line = " · ".join(f"{_short_activity_label(a)} {p:.0f}%" for a, p in mix.items())
+                n_absent = int(absence_count_by_date.get(d, 0))
+                absence_line = f'<div class="cal-absence">🤒 {n_absent}</div>' if n_absent > 0 else ""
                 tooltip_lines = [f"{d:%d.%m.%Y} — {pct:.1f}% vytíženo", f"{n_ws} pracovišť obsazeno"]
+                if n_absent:
+                    tooltip_lines.append(f"{n_absent} nepřítomných")
                 tooltip_lines += [f"{a}: {p:.0f}%" for a, p in mix.items()]
                 tooltip = "\n".join(tooltip_lines)
                 cells.append(
                     f'<div class="cal-cell" style="background:{bg}; color:{text_color}" title="{tooltip}">'
                     f'<div class="cal-cell-top"><span class="cal-day">{d.day}</span><span class="cal-pct">{pct:.0f}%</span></div>'
                     f'<div class="cal-ws">{n_ws} prac.</div>'
+                    f'{absence_line}'
                     f'<div class="cal-mix">{mix_line}</div>'
                     f'</div>'
                 )
@@ -1239,7 +1267,7 @@ footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px
 .cal-weekday { text-align: center; font-size: 11.5px; color: #898781; font-weight: 600; }
 .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
 .cal-cell {
-    min-height: 96px; border-radius: 8px; padding: 6px 8px; display: flex;
+    min-height: 108px; border-radius: 8px; padding: 6px 8px; display: flex;
     flex-direction: column; gap: 3px; border: 1px solid rgba(11,11,11,0.06); overflow: hidden;
 }
 .cal-cell.out { border: none; background: transparent; min-height: 0; }
@@ -1248,6 +1276,7 @@ footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px
 .cal-day { font-size: 12px; font-weight: 600; }
 .cal-pct { font-size: 11px; font-weight: 600; }
 .cal-ws { font-size: 10px; opacity: 0.9; }
+.cal-absence { font-size: 10px; opacity: 0.9; }
 .cal-mix { font-size: 9px; line-height: 1.3; opacity: 0.9; }
 
 /* Klikatelný řádek v přehledu poboček */
@@ -1516,8 +1545,8 @@ def build_html_report(
     front_page_summary = build_front_page_summary(branch_summary, merged, absences)
     branch_table_html = build_branch_overview_table_html(front_page_summary)
 
-    combined_daily, activity_mix_by_date = build_combined_daily_calendar_data(branch_daily, merged, absences)
-    calendar_html = build_month_calendar_html(combined_daily, activity_mix_by_date)
+    combined_daily, activity_mix_by_date, absence_count_by_date = build_combined_daily_calendar_data(branch_daily, merged, absences)
+    calendar_html = build_month_calendar_html(combined_daily, activity_mix_by_date, absence_count_by_date)
 
     # --- Rozbalovací karta pro každou pobočku -----------------------------------
     workstation_summary = summarize_workstations(workstation_daily, segments)
@@ -1726,7 +1755,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-17 (denní rozvrh po 10 minutách nahrazen blokem progress barů po pracovištích, granularita Dny/Týdny/Měsíce, bez stránkování po týdnech)"
+SCRIPT_VERSION = "2026-07-17b (nepřítomnosti filtrované na povolené typy+APPROVED, kalendář: emotikon nemocného + počet, absolutní škála zelené)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
