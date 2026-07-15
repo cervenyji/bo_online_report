@@ -226,14 +226,6 @@ def read_xlsx(path, sheet_index=0):
     return pd.DataFrame(data, columns=header)
 
 
-def read_xlsx_with_header_row(path, header_row=0, sheet_index=0):
-    """Jako read_xlsx, ale hlavička není na prvním řádku listu — `header_row` řádků
-    (typicky export-metadata) se přeskočí. Odpovídá pandas.read_excel(skiprows=header_row)."""
-    rows = read_xlsx_rows(path, sheet_index)[header_row:]
-    header, *data = rows
-    return pd.DataFrame(data, columns=header)
-
-
 # -----------------------------------------------------------------------------
 # 3. Načtení a příprava dat
 # -----------------------------------------------------------------------------
@@ -355,19 +347,27 @@ def load_segments(path, sheet_name=SEGMENTS_SHEET_NAME):
 
 
 def load_absences(path, org_unit_zkratka):
-    """Načte export nepřítomností z HR systému (Nepřítomnosti.xlsx). V reálném
-    exportu bývají před hlavičkou 2 řádky metadat (odpovídá skiprows=2). Filtruje
-    jen na `org_unit_zkratka` (pilotní pobočka) a vrátí denní tabulku EMPLOYEE×DATE
-    s podílem dne (ABSENCE_FRACTION, 0-1), kdy zaměstnanec nebyl k dispozici -
-    v tomto exportu KAŽDÝ typ nepřítomnosti (dovolená, nemoc, home office, ...)
-    znamená, že ten den nemohl použít žádné pracoviště."""
+    """Načte export nepřítomností z HR systému (Nepřítomnosti.xlsx). Před hlavičkou
+    bývá pár řádků metadat ("Exportováno do formátu Excel dne...") - jejich přesný
+    počet se mezi exporty může lišit, proto se řádek s hlavičkou hledá automaticky
+    (první řádek obsahující 'Příjmení'), místo pevného skiprows. Filtruje jen na
+    `org_unit_zkratka` (pilotní pobočka) a vrátí denní tabulku EMPLOYEE×DATE s
+    podílem dne (ABSENCE_FRACTION, 0-1), kdy zaměstnanec nebyl k dispozici - v tomto
+    exportu KAŽDÝ typ nepřítomnosti (dovolená, nemoc, home office, ...) znamená, že
+    ten den nemohl použít žádné pracoviště."""
+    needed = ["Příjmení", "Jméno", "Zkratka organizační jednotky", "Začátek - datum", "Konec - datum", "Počet dní"]
     try:
-        raw = read_xlsx_with_header_row(path, header_row=2)
+        rows = read_xlsx_rows(path)
     except (FileNotFoundError, zipfile.BadZipFile):
         print(f"Pozor: soubor s nepřítomnostmi '{path}' nebyl nalezen — sekce nepřítomnosti se vynechá.")
         return pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
 
-    needed = ["Příjmení", "Jméno", "Zkratka organizační jednotky", "Začátek - datum", "Konec - datum", "Počet dní"]
+    header_row = next((i for i, r in enumerate(rows[:10]) if "Příjmení" in r), None)
+    if header_row is None:
+        raise ValueError(f"V souboru {path} se v prvních 10 řádcích nenašla hlavička (sloupec 'Příjmení').")
+    header, *data = rows[header_row:]
+    raw = pd.DataFrame(data, columns=header)
+
     missing = [c for c in needed if c not in raw.columns]
     if missing:
         raise ValueError(f"V souboru {path} chybí očekávané sloupce: {missing}")
@@ -1558,7 +1558,7 @@ function stepWeek(btn, delta) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-14b (segmenty se čtou z listu struktura_pracovist_segmenty uvnitř qr_codes_bo_online.xlsx)"
+SCRIPT_VERSION = "2026-07-14c (nepřítomnosti: hlavička se v exportu hledá automaticky, ne pevným skiprows)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
