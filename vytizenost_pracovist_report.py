@@ -65,6 +65,8 @@ PILOT_BUILDINGS = {
     "Jugoslávská (budova)": range(1, 5),    # pracoviště 1-4 - zatím nenainstalováno
     "Olbrachtova (budova)": range(5, 21),   # pracoviště 5-20
 }
+ABSENCE_APPLIES_TO_BUILDING = "Olbrachtova (budova)"  # nepřítomnost se týká jen zaměstnanců zde -
+# Jugoslávská (1-4) zatím není v provozu, takže se jí odečítání nepřítomných netýká.
 
 # --- Barevná paleta (validovaná: lightness/chroma/CVD/kontrast) --------------
 PAGE_BG = "#f9f9f7"
@@ -247,6 +249,27 @@ def _parse_datetime_cell(value):
         return pd.to_datetime(text, dayfirst=True, errors="coerce")
 
 
+def _parse_time_cell(value):
+    """Buňka typu 'Začátek - čas'/'Konec - čas' může přijít jako skutečný Excel čas
+    (naše čtečka ho vrátí jako datetime s datem 1899-12-30 - jen čas je platný),
+    jako holé číslo (zlomek dne, když styl nebyl rozpoznán jako datum/čas), nebo
+    jako text ('08:00', '08:00:00'). Vrátí datetime.time, nebo None."""
+    if isinstance(value, datetime):
+        return value.time()
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (int, float)):
+        total_seconds = round((value % 1) * 86400)
+        return (datetime.min + timedelta(seconds=total_seconds)).time()
+    text = str(value).strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
 def load_activities(path):
     """Načte bo_data.xlsx, sjednotí názvy sloupců (dle pozice, ne dle přesného
     znění hlavičky) a vrátí (očištěná_data, řádky_s_problémem)."""
@@ -388,19 +411,34 @@ ABSENCE_TYPES_COUNTED = [
 ABSENCE_STATUS_COUNTED = "APPROVED"
 
 
-def load_absences(path, org_unit_zkratka):
+def load_absences(path, org_unit_zkratka, valid_dates=None, capacity_day_hours=8.0):
     """Načte export nepřítomností z HR systému (Nepřítomnosti.xlsx). Před hlavičkou
     bývá pár řádků metadat ("Exportováno do formátu Excel dne...") - jejich přesný
     počet se mezi exporty může lišit, proto se řádek s hlavičkou hledá automaticky
     (první řádek obsahující 'Příjmení'), místo pevného skiprows. Filtruje na
     `org_unit_zkratka` (pilotní pobočka), na typy nepřítomnosti z
     ABSENCE_TYPES_COUNTED a na stav žádosti ABSENCE_STATUS_COUNTED (schválené) -
-    ostatní typy (např. náhrada mzdy) ani neschválené žádosti se nepočítají. Vrátí
-    denní tabulku EMPLOYEE×DATE s podílem dne (ABSENCE_FRACTION, 0-1), kdy
-    zaměstnanec nebyl k dispozici a nemohl použít žádné pracoviště."""
+    ostatní typy (např. náhrada mzdy) ani neschválené žádosti se nepočítají.
+
+    Nepřítomnost se rozprostírá jen na PRACOVNÍ dny (Po-Pá), a pokud je zadané
+    `valid_dates` (dny, které se skutečně objevují v datech aktivit budovy, na
+    kterou se nepřítomnost aplikuje - viz ABSENCE_APPLIES_TO_BUILDING), tak jen
+    na průnik s nimi. Bez tohoto omezení by se do rozprostření započítaly i
+    víkendy nebo dny mimo sledované období, které v reportu vůbec neexistují -
+    a den na okraji rozsahu (např. pátek-pondělí přes víkend) by tak dostal
+    nesprávně nízký podíl místo celého dne.
+
+    Celkový rozsah nepřítomnosti v hodinách se bere přednostně ze sloupce
+    "Počet hodin" (nejpřesnější, rozlišuje i půldenní žádosti); pokud chybí, u
+    jednodenní žádosti se dopočítá z "Začátek - čas"/"Konec - čas"; jinak se
+    odhadne ze sloupce "Počet dní" × `capacity_day_hours` (standardní délka
+    pracovního dne). Výsledné hodiny se rovnoměrně rozprostřou přes platné dny.
+
+    Vrátí denní tabulku EMPLOYEE×DATE s podílem dne (ABSENCE_FRACTION, 0-1),
+    kdy zaměstnanec nebyl k dispozici a nemohl použít žádné pracoviště."""
     needed = [
         "Příjmení", "Jméno", "Zkratka organizační jednotky", "Začátek - datum", "Konec - datum",
-        "Počet dní", "Typ nepřítomnosti", "Stav žádosti",
+        "Začátek - čas", "Konec - čas", "Počet dní", "Počet hodin", "Typ nepřítomnosti", "Stav žádosti",
     ]
     try:
         rows = read_xlsx_rows(path)
@@ -429,18 +467,40 @@ def load_absences(path, org_unit_zkratka):
     df["EMPLOYEE"] = df["Příjmení"].astype(str).str.strip() + " " + df["Jméno"].astype(str).str.strip()
     start = pd.to_datetime(df["Začátek - datum"]).dt.normalize()
     end = pd.to_datetime(df["Konec - datum"]).dt.normalize()
-    pocet_dni = pd.to_numeric(df["Počet dní"], errors="coerce").fillna(1.0)
+    pocet_dni = pd.to_numeric(df["Počet dní"], errors="coerce")
+    pocet_hodin = pd.to_numeric(df["Počet hodin"], errors="coerce")
+    start_time = df["Začátek - čas"].map(_parse_time_cell)
+    end_time = df["Konec - čas"].map(_parse_time_cell)
+
+    valid_dates_idx = pd.DatetimeIndex(valid_dates) if valid_dates is not None else None
 
     rows = []
-    for employee, s, e, nd in zip(df["EMPLOYEE"], start, end, pocet_dni):
+    for employee, s, e, nd, nh, t_start, t_end in zip(
+        df["EMPLOYEE"], start, end, pocet_dni, pocet_hodin, start_time, end_time
+    ):
         if pd.isna(s) or pd.isna(e):
             continue
-        n_calendar_days = (e - s).days + 1
-        if n_calendar_days <= 0:
+        day_range = pd.bdate_range(s, e)  # jen pracovní dny (Po-Pá)
+        if valid_dates_idx is not None:
+            day_range = day_range.intersection(valid_dates_idx)
+        if len(day_range) == 0:
             continue
-        frac_per_day = min(1.0, nd / n_calendar_days)  # rozprostře Počet dní rovnoměrně přes rozsah (i půldenní)
-        for i in range(n_calendar_days):
-            rows.append({"EMPLOYEE": employee, "DATE": s + pd.Timedelta(days=i), "ABSENCE_FRACTION": frac_per_day})
+
+        if pd.notna(nh) and nh > 0:
+            total_hours = nh
+        elif s == e and t_start is not None and t_end is not None:
+            total_hours = max(0.0, (
+                datetime.combine(datetime.min, t_end) - datetime.combine(datetime.min, t_start)
+            ).total_seconds() / 3600)
+        elif pd.notna(nd) and nd > 0:
+            total_hours = nd * capacity_day_hours
+        else:
+            total_hours = len(day_range) * capacity_day_hours
+
+        hours_per_day = total_hours / len(day_range)
+        frac_per_day = min(1.0, hours_per_day / capacity_day_hours) if capacity_day_hours > 0 else 0.0
+        for d in day_range:
+            rows.append({"EMPLOYEE": employee, "DATE": d, "ABSENCE_FRACTION": frac_per_day})
 
     if not rows:
         return pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
@@ -890,14 +950,15 @@ def build_workstation_progress_html(workstation_daily_scope, merged_scope, branc
 
 # --- Pilotní rozšíření: nepřítomnost zaměstnanců a rozdělení na budovy ------
 
-def compute_pilot_building_daily(merged, branch_id, workstation_range, capacity_min_per_workstation, absence_daily):
+def compute_pilot_building_daily(merged, branch_id, workstation_range, capacity_min_per_workstation, absence_daily, building_name):
     """Denní agregace pro JEDNU budovu pilotní pobočky (podmnožina WORKSTATION_ID) —
     stejný tvar jako branch_daily (BRANCH_ID, DATE, N_ACTIVITIES, DURATION_MIN,
     UTILIZATION_PCT, BUCKET), takže ji lze beze změny použít ve všech grafech, které
     jinak očekávají branch_daily. Kapacita = počet pracovišť TÉTO budovy (ne celé
-    pobočky) × kapacita/pracoviště/den, snížená o poměrný podíl nepřítomných
-    zaměstnanců (dle podílu pracovišť budovy na celkovém počtu pracovišť pobočky) —
-    vytíženost se tak počítá vůči efektivní, ne nominální kapacitě."""
+    pobočky) × kapacita/pracoviště/den. Nepřítomnost zaměstnanců se odečítá VÝHRADNĚ
+    u `ABSENCE_APPLIES_TO_BUILDING` (Olbrachtova) — tam se reálně pracuje; Jugoslávská
+    zatím není v provozu, takže by jí poměrné odečítání jen uměle zkreslovalo
+    vytíženost. Vytíženost se tak počítá vůči efektivní, ne nominální kapacitě."""
     workstation_ids = list(workstation_range)
     n_workstations = len(workstation_ids)
     raw_capacity_min = n_workstations * capacity_min_per_workstation
@@ -907,13 +968,12 @@ def compute_pilot_building_daily(merged, branch_id, workstation_range, capacity_
     usage_by_date = b.groupby("DATE")["DURATION_MIN"].sum() if not b.empty else pd.Series(dtype=float)
     activities_by_date = b.groupby("DATE").size() if not b.empty else pd.Series(dtype=int)
 
-    total_ws_all_buildings = sum(len(list(r)) for r in PILOT_BUILDINGS.values())
-    building_share = n_workstations / total_ws_all_buildings if total_ws_all_buildings else 0.0
+    applies_absence = building_name == ABSENCE_APPLIES_TO_BUILDING
     absence_by_date = absence_daily.set_index("DATE")["N_ABSENT"] if not absence_daily.empty else pd.Series(dtype=float)
 
     out = []
     for d in dates:
-        n_absent_building = absence_by_date.get(d, 0.0) * building_share
+        n_absent_building = absence_by_date.get(d, 0.0) if applies_absence else 0.0
         effective_capacity_min = max(0.0, raw_capacity_min - n_absent_building * capacity_min_per_workstation)
         actual_min = usage_by_date.get(d, 0.0)
         util_pct = (actual_min / effective_capacity_min * 100) if effective_capacity_min > 0 else np.nan
@@ -1020,7 +1080,7 @@ def build_front_page_summary(branch_summary, merged, absences, employees):
             ws_ids = list(ws_range)
             n_ws = len(ws_ids)
             raw_capacity_day_hours = n_ws * capacity_min_per_workstation / 60
-            b_daily_building = compute_pilot_building_daily(merged, branch_id, ws_ids, capacity_min_per_workstation, absence_daily)
+            b_daily_building = compute_pilot_building_daily(merged, branch_id, ws_ids, capacity_min_per_workstation, absence_daily, building_name)
             if b_daily_building.empty:
                 rows.append({
                     "BRANCH_ID": branch_id, "BRANCH_NAME": f"{branch_name} — {building_name}",
@@ -1067,8 +1127,8 @@ def build_combined_daily_calendar_data(branch_daily, merged, absences, employees
         absence_daily = compute_absence_daily(absences_df, employee_base)
 
         pilot_frames = []
-        for ws_range in PILOT_BUILDINGS.values():
-            bd = compute_pilot_building_daily(merged, PILOT_BRANCH_ID, list(ws_range), capacity_min_per_workstation, absence_daily)
+        for building_name, ws_range in PILOT_BUILDINGS.items():
+            bd = compute_pilot_building_daily(merged, PILOT_BRANCH_ID, list(ws_range), capacity_min_per_workstation, absence_daily, building_name)
             if not bd.empty:
                 pilot_frames.append(bd[["DATE", "DURATION_MIN", "EFFECTIVE_CAPACITY_MIN"]].rename(columns={"EFFECTIVE_CAPACITY_MIN": "CAPACITY_MIN"}))
         if pilot_frames:
@@ -1681,7 +1741,7 @@ def build_html_report(
             for building_name, ws_range in PILOT_BUILDINGS.items():
                 ws_ids = list(ws_range)
                 n_ws = len(ws_ids)
-                b_daily_building = compute_pilot_building_daily(merged, branch_id, ws_ids, capacity_min_per_workstation, absence_daily)
+                b_daily_building = compute_pilot_building_daily(merged, branch_id, ws_ids, capacity_min_per_workstation, absence_daily, building_name)
                 b_merged_building = b_merged_all.loc[b_merged_all["WORKSTATION_ID"].isin(ws_ids)]
                 n_activities_total += len(b_merged_building)
                 b_hours_total += b_merged_building["DURATION_MIN"].sum() / 60
@@ -1855,18 +1915,16 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18 (Celkový seznam zaměstnanců z listu 'zamestnanci' - autoritativní základna pro % nepřítomnosti + porovnání s aktivitami/nepřítomností pro Olbrachtovu budovu)"
+SCRIPT_VERSION = "2026-07-18b (Nepřítomnosti: Počet hodin + Začátek/Konec - čas, rozprostření jen na pracovní dny v datech aktivit, odečítání kapacity jen pro Olbrachtovu)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
 workspaces = load_workspaces(WORKSPACES_FILE)
 segments = load_segments(SEGMENTS_FILE)
-absences = load_absences(ABSENCE_FILE, PILOT_ORG_UNIT_ZKRATKA)
 employees = load_employees(EMPLOYEES_FILE, EMPLOYEES_SHEET_NAME)
 print(f"Aktivity: {len(activities)} platných řádků, {len(data_issues)} přeskočeno (chybná data).")
 print(f"Pobočky (work_spaces.xlsx): {len(workspaces)}")
 print(f"Segmenty pracovišť: {len(segments)} řádků")
-print(f"Nepřítomnosti (pilotní pobočka {PILOT_ORG_UNIT_ZKRATKA}): {len(absences)} záznamů (zaměstnanec×den)")
 print(f"Zaměstnanci (list '{EMPLOYEES_SHEET_NAME}'): {len(employees)} osob")
 
 merged, unknown_branches = merge_activities_with_workspaces(activities, workspaces)
@@ -1881,6 +1939,24 @@ if merged.empty:
         "Po spojení s work_spaces.xlsx nezůstala žádná platná aktivita (žádné BRANCH_ID se "
         "neshoduje mezi bo_data.xlsx a work_spaces.xlsx) — viz vypsané seznamy ID výš."
     )
+
+# Nepřítomnost se rozprostírá jen na dny, které se skutečně objevují v datech
+# aktivit budovy Olbrachtova (jediná budova pilotní pobočky, kde se reálně
+# pracuje - viz ABSENCE_APPLIES_TO_BUILDING) - proto se `absences` načítá až
+# tady, po spojení aktivit s work_spaces.xlsx.
+_absence_building_ws = list(PILOT_BUILDINGS[ABSENCE_APPLIES_TO_BUILDING])
+_absence_scope = merged.loc[(merged["BRANCH_ID"] == PILOT_BRANCH_ID) & (merged["WORKSTATION_ID"].isin(_absence_building_ws))]
+if not _absence_scope.empty:
+    _absence_capacity_day_hours = _absence_scope["CAPACITY_MIN"].iloc[0] / 60
+    _absence_valid_dates = pd.bdate_range(_absence_scope["DATE"].min(), _absence_scope["DATE"].max())
+else:
+    _absence_capacity_day_hours = 8.0
+    _absence_valid_dates = None
+absences = load_absences(
+    ABSENCE_FILE, PILOT_ORG_UNIT_ZKRATKA,
+    valid_dates=_absence_valid_dates, capacity_day_hours=_absence_capacity_day_hours,
+)
+print(f"Nepřítomnosti (pilotní pobočka {PILOT_ORG_UNIT_ZKRATKA}): {len(absences)} záznamů (zaměstnanec×den)")
 
 workstation_daily = compute_workstation_daily(merged)
 branch_daily = compute_branch_daily(merged)
