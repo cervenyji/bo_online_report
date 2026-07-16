@@ -765,73 +765,83 @@ def build_granularity_switcher_html(merged_scope, daily_frame, branch_id, branch
     </div>"""
 
 
-def compute_workstation_period_series(workstation_daily_scope, branch_id, granularity):
-    """Pro KAŽDÉ pracoviště pobočky/budovy vrátí chronologickou řadu (popisek, %)
-    agregovanou na zvolené úrovni (dny/týdny/měsíce). Kapacita jednoho pracoviště
-    je v rámci pobočky konstantní napříč dny, takže vážený součet
-    (odpracované minuty / kapacita) je totéž jako průměr denních %."""
+def compute_workstation_average_summary(workstation_daily_scope, merged_scope, branch_id, granularity):
+    """Pro KAŽDÉ pracoviště pobočky/budovy spočítá (a) průměrnou vytíženost na
+    zvolené úrovni agregace (průměrný den/týden/měsíc) a (b) % rozložení
+    odpracovaného času podle typu aktivity (přes celé sledované období) — pro
+    jeden přes celou šířku vyplněný progress bar barevně složený dle aktivit."""
     d = workstation_daily_scope.loc[workstation_daily_scope["BRANCH_ID"] == branch_id].copy()
     if d.empty:
         return {}
 
     if granularity == "days":
         d["GROUP_KEY"] = d["DATE"]
-        label_fmt = "%d.%m."
     elif granularity == "weeks":
         d["GROUP_KEY"] = d["DATE"] - pd.to_timedelta(d["DATE"].dt.weekday, unit="D")
-        label_fmt = "%d.%m."
     elif granularity == "months":
         d["GROUP_KEY"] = d["DATE"].dt.to_period("M").dt.to_timestamp()
-        label_fmt = "%m/%Y"
     else:
         raise ValueError(f"Neznámá granularita: {granularity}")
 
+    m = merged_scope.loc[merged_scope["BRANCH_ID"] == branch_id]
+
     out = {}
     for ws_id, g in d.groupby("WORKSTATION_ID"):
-        grouped = (
-            g.groupby("GROUP_KEY").agg(DURATION_MIN=("DURATION_MIN", "sum"), CAPACITY_MIN=("CAPACITY_MIN", "sum"))
-            .reset_index().sort_values("GROUP_KEY")
-        )
+        grouped = g.groupby("GROUP_KEY").agg(DURATION_MIN=("DURATION_MIN", "sum"), CAPACITY_MIN=("CAPACITY_MIN", "sum")).reset_index()
         grouped["UTILIZATION_PCT"] = np.where(grouped["CAPACITY_MIN"] > 0, grouped["DURATION_MIN"] / grouped["CAPACITY_MIN"] * 100, np.nan)
-        grouped["LABEL"] = grouped["GROUP_KEY"].dt.strftime(label_fmt)
-        out[int(ws_id)] = list(zip(grouped["LABEL"], grouped["UTILIZATION_PCT"]))
+        avg_pct = grouped["UTILIZATION_PCT"].mean()
+
+        ws_activities = m.loc[m["WORKSTATION_ID"] == ws_id]
+        total_dur = ws_activities["DURATION_MIN"].sum()
+        mix = (
+            (ws_activities.groupby("ACTIVITY")["DURATION_MIN"].sum() / total_dur).sort_values(ascending=False)
+            if total_dur > 0 else pd.Series(dtype=float)
+        )
+        out[int(ws_id)] = {"avg_pct": avg_pct, "mix": mix.to_dict()}
     return out
 
 
-def _mini_progress_html(label, pct, color):
-    fill_pct = min(100, max(0, pct)) if pd.notna(pct) else 0
-    pct_label = f"{pct:.0f}%" if pd.notna(pct) else "—"
-    return f"""<div class="wsprog-item" title="{label}: {pct_label}">
-      <div class="wsprog-track"><div class="wsprog-fill" style="width:{fill_pct:.0f}%; background:{color}"></div></div>
-      <div class="wsprog-label">{label}</div>
-    </div>"""
+_WS_PROGRESS_GRANULARITY_LABELS = [("days", "Průměrný den"), ("weeks", "Průměrný týden"), ("months", "Průměrný měsíc")]
 
 
-_WS_PROGRESS_GRANULARITY_LABELS = [("days", "Dny"), ("weeks", "Týdny"), ("months", "Měsíce")]
-
-
-def build_workstation_progress_html(workstation_daily_scope, branch_id, container_id):
-    """Blok po pracovištích — každé pracoviště má vlastní řadu progress barů
-    naplněných dle vytíženosti, s přepínačem granularity Dny/Týdny/Měsíce (žádné
-    stránkování po týdnech, jen přepnutí úrovně agregace)."""
+def build_workstation_progress_html(workstation_daily_scope, merged_scope, branch_id, container_id):
+    """Blok po pracovištích — každé pracoviště má JEDEN progress bar přes celou
+    šířku, naplněný na % odpovídající průměrné vytíženosti (den/týden/měsíc dle
+    přepínače) a barevně složený ze segmentů podle typu aktivity (velikost
+    segmentu = jeho podíl na odpracovaném čase daného pracoviště)."""
     ws_ids = sorted(workstation_daily_scope.loc[workstation_daily_scope["BRANCH_ID"] == branch_id, "WORKSTATION_ID"].unique())
     if not ws_ids:
         return '<p class="note">Žádná data.</p>'
 
+    activities_present = sorted(merged_scope.loc[merged_scope["BRANCH_ID"] == branch_id, "ACTIVITY"].unique())
+    activity_color = {a: CATEGORICAL[i % len(CATEGORICAL)] for i, a in enumerate(activities_present)}
+    legend_html = "".join(
+        f'<span class="wsfull-legend-item"><i style="background:{activity_color[a]}"></i>{a}</span>'
+        for a in activities_present
+    )
+
     pages, buttons = [], []
     for key, cz_label in _WS_PROGRESS_GRANULARITY_LABELS:
-        series_by_ws = compute_workstation_period_series(workstation_daily_scope, branch_id, key)
+        summary_by_ws = compute_workstation_average_summary(workstation_daily_scope, merged_scope, branch_id, key)
         blocks = []
         for ws_id in ws_ids:
-            items = series_by_ws.get(int(ws_id), [])
-            bars = "".join(
-                _mini_progress_html(label, pct, BUCKET_COLORS.get(utilization_bucket(pct), STATUS_MUTED))
-                for label, pct in items
+            info = summary_by_ws.get(int(ws_id))
+            if not info or pd.isna(info["avg_pct"]):
+                blocks.append(f"""
+      <div class="ws-block-full">
+        <div class="ws-block-header"><span class="ws-block-name">Pracoviště {ws_id}</span><span class="ws-block-pct">—</span></div>
+        <div class="wsfull-track"></div>
+      </div>""")
+                continue
+            avg_pct = max(0.0, min(100.0, info["avg_pct"]))
+            segs = "".join(
+                f'<div class="wsfull-seg" style="width:{frac * 100:.2f}%; background:{activity_color[a]}" title="{a}: {frac * 100:.0f}%"></div>'
+                for a, frac in info["mix"].items()
             )
             blocks.append(f"""
-      <div class="ws-block">
-        <h4>Pracoviště {ws_id}</h4>
-        <div class="ws-bar-row">{bars if bars else '<p class="note">Žádná data.</p>'}</div>
+      <div class="ws-block-full">
+        <div class="ws-block-header"><span class="ws-block-name">Pracoviště {ws_id}</span><span class="ws-block-pct">{info["avg_pct"]:.1f} %</span></div>
+        <div class="wsfull-track"><div class="wsfull-fill" style="width:{avg_pct:.2f}%">{segs}</div></div>
       </div>""")
         active = key == "days"
         pages.append(f'<div class="gran-page{" active" if active else ""}" data-key="{key}">{"".join(blocks)}</div>')
@@ -842,6 +852,7 @@ def build_workstation_progress_html(workstation_daily_scope, branch_id, containe
     return f"""
     <div class="gran-wrap" id="{container_id}">
       <div class="gran-controls">{"".join(buttons)}</div>
+      <div class="wsfull-legend">{legend_html}</div>
       {"".join(pages)}
     </div>"""
 
@@ -1250,14 +1261,18 @@ footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px
 .gran-page { display: none; }
 .gran-page.active { display: block; }
 
-/* Vytíženost pracovišť v čase — blok progress barů po pracovištích */
-.ws-block { margin-bottom: 20px; }
-.ws-block h4 { margin: 0 0 8px 0; font-size: 13px; }
-.ws-bar-row { display: flex; flex-wrap: wrap; gap: 6px; }
-.wsprog-item { display: flex; flex-direction: column; gap: 3px; width: 54px; }
-.wsprog-track { height: 10px; border-radius: 5px; background: #e1e0d9; overflow: hidden; }
-.wsprog-fill { height: 100%; border-radius: 5px; }
-.wsprog-label { font-size: 9px; color: #898781; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Vytíženost pracovišť v čase — jeden progress bar přes celou šířku na pracoviště,
+   barevně složený ze segmentů podle typu aktivity */
+.wsfull-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-bottom: 14px; }
+.wsfull-legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #52514e; }
+.wsfull-legend-item i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex: none; }
+.ws-block-full { margin-bottom: 14px; }
+.ws-block-header { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px; margin-bottom: 4px; }
+.ws-block-name { font-weight: 600; }
+.ws-block-pct { color: #52514e; }
+.wsfull-track { width: 100%; height: 22px; background: #e1e0d9; border-radius: 6px; overflow: hidden; display: flex; }
+.wsfull-fill { height: 100%; display: flex; }
+.wsfull-seg { height: 100%; }
 
 /* Kalendářní přehled (titulní strana) */
 .month-nav-wrap { margin-top: 10px; }
@@ -1460,7 +1475,7 @@ def render_branch_body(
       </div>'''
 
     ws_progress_container_id = f"wsprog-{branch_id}-{'-'.join(str(i) for i in ws_ids) if ws_ids else 'all'}"
-    ws_progress_html = build_workstation_progress_html(workstation_daily_scope, branch_id, ws_progress_container_id)
+    ws_progress_html = build_workstation_progress_html(workstation_daily_scope, merged_scope, branch_id, ws_progress_container_id)
 
     return f"""
       {kpi_html}
@@ -1475,8 +1490,9 @@ def render_branch_body(
       {gran_switcher_html}
 
       <h3 style="margin-top:26px">Vytíženost pracovišť v čase</h3>
-      <p class="note">Blok pro každé pracoviště zvlášť — progress bar naplněný podle vytíženosti vůči kapacitě.
-      Přepínač Dny/Týdny/Měsíce mění úroveň agregace (bez stránkování po týdnech).</p>
+      <p class="note">Jeden progress bar přes celou šířku pro každé pracoviště — délka výplně odpovídá
+      průměrné vytíženosti (přepínač Průměrný den/Týden/Měsíc), barevné segmenty uvnitř výplně ukazují,
+      jaké aktivity se na daném pracovišti odehrávají a v jakém poměru.</p>
       {ws_progress_html}
 
       {activity_employee_block}
@@ -1755,7 +1771,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-17b (nepřítomnosti filtrované na povolené typy+APPROVED, kalendář: emotikon nemocného + počet, absolutní škála zelené)"
+SCRIPT_VERSION = "2026-07-17c (Vytíženost pracovišť v čase: jeden progress bar přes celou šířku na pracoviště, barevně složený dle aktivit, průměrný den/týden/měsíc)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
