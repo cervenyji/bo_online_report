@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 import zipfile
@@ -1259,6 +1260,57 @@ def _short_activity_label(name, max_len=9):
     return name if len(name) <= max_len else name[:max_len - 1] + "…"
 
 
+DAY_DETAIL_SLOT_MINUTES = 10  # rozlišení popupu "Denní rozvrh pracovišť" po kliknutí na den v kalendáři
+
+
+def compute_day_workstation_slots(merged):
+    """Podklad pro popup 'Denní rozvrh pracovišť' otevíraný kliknutím na den v
+    kalendáři na titulní straně: pro každý den se sesbírá KAŽDÉ pracoviště (přes
+    všechny pobočky), které ten den má nějakou aktivitu, a jeho obsazenost po
+    DAY_DETAIL_SLOT_MINUTES-minutových slotech (která aktivita v daném slotu
+    probíhala). Časové okno slotů je společné pro všechny dny (odvozené z
+    pozorovaného rozsahu časů v celém datasetu), aby byl popup vizuálně
+    konzistentní napříč dny. Vrátí (day_slots, slot_labels, activity_color) -
+    vše určené k embedování jako JSON do HTML a vykreslení v JS."""
+    if merged.empty:
+        return {}, [], {}
+
+    minute_of_day = merged["DATETIME"].dt.hour * 60 + merged["DATETIME"].dt.minute
+    start_of_day_min = int(minute_of_day.min())
+    end_of_day_min = int((minute_of_day + merged["DURATION_MIN"]).max())
+    start_of_day_min = (start_of_day_min // DAY_DETAIL_SLOT_MINUTES) * DAY_DETAIL_SLOT_MINUTES
+    end_of_day_min = -(-end_of_day_min // DAY_DETAIL_SLOT_MINUTES) * DAY_DETAIL_SLOT_MINUTES
+    end_of_day_min = max(end_of_day_min, start_of_day_min + DAY_DETAIL_SLOT_MINUTES)
+
+    slot_starts = list(range(start_of_day_min, end_of_day_min, DAY_DETAIL_SLOT_MINUTES))
+    slot_labels = [f"{m // 60:02d}:{m % 60:02d}" for m in slot_starts]
+    n_slots = len(slot_starts)
+
+    all_activities = sorted(merged["ACTIVITY"].unique())
+    activity_color = {a: CATEGORICAL[i % len(CATEGORICAL)] for i, a in enumerate(all_activities)}
+
+    m = merged.copy()
+    m["START_MIN"] = m["DATETIME"].dt.hour * 60 + m["DATETIME"].dt.minute
+    m["END_MIN"] = m["START_MIN"] + m["DURATION_MIN"]
+
+    day_slots = {}
+    for date, day_group in m.groupby("DATE"):
+        date_key = date.strftime("%Y-%m-%d")
+        ws_entries = []
+        for (bid, wid, bname), wg in day_group.groupby(["BRANCH_ID", "WORKSTATION_ID", "BRANCH_NAME"]):
+            slots = [None] * n_slots
+            for _, row in wg.iterrows():
+                first_idx = max(0, (int(row["START_MIN"]) - start_of_day_min) // DAY_DETAIL_SLOT_MINUTES)
+                last_idx = min(n_slots - 1, (int(row["END_MIN"]) - start_of_day_min - 1) // DAY_DETAIL_SLOT_MINUTES)
+                for i in range(first_idx, last_idx + 1):
+                    slots[i] = row["ACTIVITY"]
+            ws_entries.append({"branch": bname, "branch_id": int(bid), "ws": int(wid), "slots": slots})
+        ws_entries.sort(key=lambda e: (e["branch"], e["ws"]))
+        day_slots[date_key] = ws_entries
+
+    return day_slots, slot_labels, activity_color
+
+
 def build_month_calendar_html(daily_combined, activity_mix_by_date, absence_count_by_date):
     """Kalendářový přehled: dny vybraného měsíce v mřížce Po–Ne, sytost zelené =
     kombinovaná vytíženost všech poboček dohromady. Barva je škálovaná vůči
@@ -1305,9 +1357,12 @@ def build_month_calendar_html(daily_combined, activity_mix_by_date, absence_coun
                 if n_absent:
                     tooltip_lines.append(f"{n_absent} nepřítomných")
                 tooltip_lines += [f"{a}: {p:.0f}%" for a, p in mix.items()]
+                tooltip_lines.append("Klikněte pro denní rozvrh pracovišť")
                 tooltip = "\n".join(tooltip_lines)
+                date_key = d.strftime("%Y-%m-%d")
                 cells.append(
-                    f'<div class="cal-cell" style="background:{bg}; color:{text_color}" title="{tooltip}">'
+                    f'<div class="cal-cell cal-cell-clickable" style="background:{bg}; color:{text_color}" '
+                    f'title="{tooltip}" onclick="openDayDetail(\'{date_key}\')">'
                     f'<div class="cal-cell-top"><span class="cal-day">{d.day}</span><span class="cal-pct">{pct:.0f}%</span></div>'
                     f'<div class="cal-ws">{n_ws} prac.</div>'
                     f'{absence_line}'
@@ -1506,6 +1561,43 @@ footer { text-align: center; color: #898781; font-size: 11.5px; margin-top: 50px
 /* Klikatelný řádek v přehledu poboček */
 tr.branch-row { cursor: pointer; }
 tr.branch-row:hover { background: #f0efec; }
+
+.cal-cell-clickable { cursor: pointer; transition: transform .08s ease, box-shadow .08s ease; }
+.cal-cell-clickable:hover { transform: scale(1.02); box-shadow: 0 2px 8px rgba(11,11,11,0.18); z-index: 1; }
+
+/* Popup "Denní rozvrh pracovišť" (klik na den v kalendáři) */
+.modal-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(11,11,11,0.55);
+    z-index: 1000; align-items: center; justify-content: center; padding: 24px;
+}
+.modal-overlay.open { display: flex; }
+.modal-panel {
+    background: #fcfcfb; border-radius: 12px; max-width: 96vw; width: 1100px; max-height: 88vh;
+    display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(11,11,11,0.35);
+}
+.modal-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 8px 20px; }
+.modal-header h3 { margin: 0; font-size: 15px; }
+.modal-close {
+    background: none; border: none; font-size: 16px; color: #898781; cursor: pointer;
+    padding: 4px 8px; border-radius: 6px; line-height: 1;
+}
+.modal-close:hover { background: #f0efec; color: #0b0b0b; }
+.day-detail-legend { padding: 0 20px 8px 20px; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.day-detail-legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: #52514e; }
+.day-detail-legend-item i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.day-detail-scroll { overflow: auto; padding: 0 20px 20px 20px; }
+table.day-detail-table { border-collapse: collapse; font-size: 10.5px; }
+table.day-detail-table th, table.day-detail-table td { padding: 0; border: none; }
+table.day-detail-table th.day-detail-time {
+    width: 15px; min-width: 15px; text-align: left; color: #898781; font-weight: 500;
+    font-size: 9px; white-space: nowrap; vertical-align: bottom; padding-bottom: 3px;
+}
+th.day-detail-ws-col, td.day-detail-ws-col {
+    position: sticky; left: 0; background: #fcfcfb; text-align: left; font-size: 11px;
+    font-weight: 600; color: #0b0b0b; padding: 3px 10px 3px 0 !important; white-space: nowrap; z-index: 1;
+}
+td.day-detail-slot { width: 15px; min-width: 15px; height: 18px; border-right: 1px solid #fcfcfb !important; }
+td.day-detail-empty { padding: 20px !important; text-align: center; color: #898781; }
 """
 
 
@@ -1806,6 +1898,14 @@ def build_html_report(
     branch_table_html = build_branch_overview_table_html(front_page_summary)
     calendar_html = build_month_calendar_html(combined_daily, activity_mix_by_date, absence_count_by_date)
 
+    # Podklad pro popup "Denní rozvrh pracovišť" (klik na den v kalendáři výše) -
+    # embedovaný jako JSON, vykreslovaný v JS (viz openDayDetail() v <script> níže).
+    day_slots, day_slot_labels, day_activity_color = compute_day_workstation_slots(merged)
+    day_detail_json = json.dumps(
+        {"slots": day_slots, "labels": day_slot_labels, "colors": day_activity_color},
+        ensure_ascii=False,
+    )
+
     # --- Rozbalovací karta pro každou pobočku -----------------------------------
     workstation_summary = summarize_workstations(workstation_daily, segments)
     growth_by_branch = growth_flags.set_index("BRANCH_ID")
@@ -1987,8 +2087,79 @@ def build_html_report(
   </div>
 
 </div>
+
+<div id="day-detail-overlay" class="modal-overlay" onclick="if(event.target===this) closeDayDetail()">
+  <div class="modal-panel">
+    <div class="modal-header">
+      <h3 id="day-detail-title">Denní rozvrh pracovišť</h3>
+      <button class="modal-close" onclick="closeDayDetail()">✕</button>
+    </div>
+    <div id="day-detail-legend" class="day-detail-legend"></div>
+    <div class="day-detail-scroll">
+      <table id="day-detail-table" class="day-detail-table"></table>
+    </div>
+  </div>
+</div>
+
 <footer>Report vygenerován automaticky z bo_data.xlsx a work_spaces.xlsx.</footer>
 <script>
+var __DAY_DETAIL__ = {day_detail_json};
+
+function openDayDetail(dateKey) {{
+  var data = __DAY_DETAIL__.slots[dateKey] || [];
+  var labels = __DAY_DETAIL__.labels || [];
+  var colors = __DAY_DETAIL__.colors || {{}};
+  var overlay = document.getElementById('day-detail-overlay');
+  var title = document.getElementById('day-detail-title');
+  var legend = document.getElementById('day-detail-legend');
+  var table = document.getElementById('day-detail-table');
+
+  var d = new Date(dateKey + 'T00:00:00');
+  var dateFmt = d.toLocaleDateString('cs-CZ', {{day: '2-digit', month: '2-digit', year: 'numeric', weekday: 'long'}});
+  title.textContent = 'Denní rozvrh pracovišť po 10 min — ' + dateFmt;
+
+  var activitiesPresent = {{}};
+  data.forEach(function(ws) {{
+    ws.slots.forEach(function(a) {{ if (a) activitiesPresent[a] = true; }});
+  }});
+  var activityNames = Object.keys(activitiesPresent).sort();
+  legend.innerHTML = activityNames.length
+    ? activityNames.map(function(a) {{
+        return '<span class="day-detail-legend-item"><i style="background:' + colors[a] + '"></i>' + a + '</span>';
+      }}).join('')
+    : '';
+
+  var headerCells = '<th class="day-detail-ws-col">Pracoviště</th>' + labels.map(function(l, i) {{
+    return '<th class="day-detail-time">' + (i % 3 === 0 ? l : '') + '</th>';
+  }}).join('');
+
+  var bodyRows;
+  if (!data.length) {{
+    bodyRows = '<tr><td colspan="' + (labels.length + 1) + '" class="day-detail-empty">Žádná data pro tento den.</td></tr>';
+  }} else {{
+    bodyRows = data.map(function(ws) {{
+      var cells = ws.slots.map(function(a) {{
+        var bg = a ? colors[a] : 'transparent';
+        return '<td class="day-detail-slot" style="background:' + bg + '" title="' + (a || 'volno') + '"></td>';
+      }}).join('');
+      return '<tr><td class="day-detail-ws-col">' + ws.branch + ' — prac. ' + ws.ws + '</td>' + cells + '</tr>';
+    }}).join('');
+  }}
+
+  table.innerHTML = '<thead><tr>' + headerCells + '</tr></thead><tbody>' + bodyRows + '</tbody>';
+  overlay.classList.add('open');
+  document.body.style.overflow = 'hidden';
+}}
+
+function closeDayDetail() {{
+  document.getElementById('day-detail-overlay').classList.remove('open');
+  document.body.style.overflow = '';
+}}
+
+document.addEventListener('keydown', function(e) {{
+  if (e.key === 'Escape') closeDayDetail();
+}});
+
 function stepMonth(btn, delta) {{
   var wrap = btn.closest('.month-nav-wrap');
   var pages = wrap.querySelectorAll('.month-page');
@@ -2032,7 +2203,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18f (Titulní KPI dlaždice 'Prům. reálné vytížení poboček' sesynchronizována s tabulkou 'Přehled všech poboček' - stejný zdroj dat)"
+SCRIPT_VERSION = "2026-07-18g (Klik na den v kalendáři otevře popup s denním rozvrhem pracovišť po 10 min, barevně dle aktivit)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
