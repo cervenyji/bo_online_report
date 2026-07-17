@@ -1069,6 +1069,33 @@ def fig_building_capacity(building_daily, building_name, n_workstations):
     return _style_chart(fig, legend=True)
 
 
+def compute_workstation_daily_real(workstation_daily_scope, daily_frame):
+    """Přepočítá vytíženost jednotlivých pracovišť vůči EFEKTIVNÍ (nepřítomností
+    snížené) kapacitě. Nepřítomnost není vázaná na konkrétní pracoviště, jen na
+    budovu/pobočku jako celek (viz compute_pilot_building_daily) — proto se na
+    každé pracoviště v daný den promítne stejný poměr snížení jako u agregátu
+    (`daily_frame`, stejný tvar jako branch_daily / výstup
+    compute_pilot_building_daily). Pokud `daily_frame` efektivní kapacitu nemá
+    (běžná pobočka bez dat o nepřítomnosti), poměr je vždy 1.0 a výsledek je
+    shodný s nominální vytížeností. Vrátí souhrn WORKSTATION_ID ×
+    (PRUMERNA_VYTIZENOST_REALNA_PCT, MAX_VYTIZENOST_REALNA_PCT) za celé období."""
+    raw_col = "RAW_CAPACITY_MIN" if "RAW_CAPACITY_MIN" in daily_frame.columns else "BRANCH_CAPACITY_MIN"
+    eff_col = "EFFECTIVE_CAPACITY_MIN" if "EFFECTIVE_CAPACITY_MIN" in daily_frame.columns else raw_col
+    ratio_by_date = (daily_frame[eff_col] / daily_frame[raw_col]).replace([np.inf, -np.inf], np.nan)
+    ratio_by_date.index = daily_frame["DATE"]
+
+    df = workstation_daily_scope.copy()
+    ratio = df["DATE"].map(ratio_by_date).fillna(1.0)
+    df["EFFECTIVE_CAPACITY_MIN"] = df["CAPACITY_MIN"] * ratio
+    df["UTILIZATION_PCT_REAL"] = np.where(
+        df["EFFECTIVE_CAPACITY_MIN"] > 0, df["DURATION_MIN"] / df["EFFECTIVE_CAPACITY_MIN"] * 100, np.nan
+    )
+    return df.groupby("WORKSTATION_ID").agg(
+        PRUMERNA_VYTIZENOST_REALNA_PCT=("UTILIZATION_PCT_REAL", "mean"),
+        MAX_VYTIZENOST_REALNA_PCT=("UTILIZATION_PCT_REAL", "max"),
+    ).reset_index()
+
+
 def build_employee_roster_comparison_html(employees, b_merged_building, absences_df):
     """Porovná CELKOVÝ seznam zaměstnanců (list 'zamestnanci') s tím, co se o nich
     ví z aktivit na pracovištích této budovy a z reportu nepřítomnosti — ukáže i
@@ -1316,7 +1343,7 @@ def build_branch_overview_table_html(front_page_summary):
     cols = [
         ("Pobočka", "BRANCH_NAME"), ("ID", "BRANCH_ID"), ("Poč. pracovišť", "NO_WORKSTATIONS"),
         ("Kapacita (h/den)", "CAPACITY_DAY_HOURS"), ("Efektivní kapacita (h/den)", "EFFECTIVE_CAPACITY_DAY_HOURS"),
-        ("Prům. vytíženost", "PRUMERNA_VYTIZENOST_PCT"), ("Max. vytíženost", "MAX_VYTIZENOST_PCT"),
+        ("Prům. reálné vytížení", "PRUMERNA_VYTIZENOST_PCT"), ("Max. reálné vytížení", "MAX_VYTIZENOST_PCT"),
         ("Dní kriticky vytíž.", "DNI_KRITICKA"), ("Odprac. hodin", "CELKEM_HODIN"),
         ("Dní s daty", "POCET_DNI"), ("Stav", "BUCKET"),
     ]
@@ -1634,14 +1661,38 @@ def render_branch_body(
     </div>
     """
 
+    # Reálné (efektivní kapacitou snížené) vytížení jednotlivých pracovišť se
+    # dopočítá jen tam, kde `daily_frame` efektivní kapacitu vůbec zná (pilotní
+    # budova s daty o nepřítomnosti) - u běžné pobočky by šlo o duplicitní
+    # sloupce se stejnými čísly jako nominální vytíženost.
+    has_effective_capacity = "RAW_CAPACITY_MIN" in daily_frame.columns and "EFFECTIVE_CAPACITY_MIN" in daily_frame.columns
+    ws_rename = {
+        "WORKSTATION_ID": "Pracoviště", "SEGMENT": "Segment", "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
+        "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
+        "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
+    }
+    ws_col_order = ["Pracoviště", "Segment", "Prům. vytíženost", "Max. vytíženost"]
+    ws_float_cols = {"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %"}
+    if has_effective_capacity:
+        ws_real = compute_workstation_daily_real(workstation_daily_scope, daily_frame)
+        b_ws_summary = b_ws_summary.merge(ws_real, on="WORKSTATION_ID", how="left")
+        ws_rename.update({
+            "PRUMERNA_VYTIZENOST_REALNA_PCT": "Prům. reálné vytížení", "MAX_VYTIZENOST_REALNA_PCT": "Max. reálné vytížení",
+        })
+        ws_col_order += ["Prům. reálné vytížení", "Max. reálné vytížení"]
+        ws_float_cols.update({"Prům. reálné vytížení": "{:.1f} %", "Max. reálné vytížení": "{:.1f} %"})
+    ws_col_order += ["Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]
+    ws_float_cols["Odprac. hodin"] = "{:.1f}"
+
     ws_table_html = _df_to_html_table(
-        b_ws_summary.rename(columns={
-            "WORKSTATION_ID": "Pracoviště", "SEGMENT": "Segment", "PRUMERNA_VYTIZENOST_PCT": "Prům. vytíženost",
-            "MAX_VYTIZENOST_PCT": "Max. vytíženost", "DNI_KRITICKA": "Dní kriticky vytíž.",
-            "CELKEM_HODIN": "Odprac. hodin", "POCET_DNI": "Dní s daty", "BUCKET": "Stav",
-        })[["Pracoviště", "Segment", "Prům. vytíženost", "Max. vytíženost", "Dní kriticky vytíž.", "Odprac. hodin", "Dní s daty", "Stav"]],
-        bucket_col="Stav",
-        float_cols={"Prům. vytíženost": "{:.1f} %", "Max. vytíženost": "{:.1f} %", "Odprac. hodin": "{:.1f}"},
+        b_ws_summary.rename(columns=ws_rename)[ws_col_order],
+        bucket_col="Stav", float_cols=ws_float_cols,
+    )
+    ws_real_note_html = (
+        '<p class="note">"Reálné vytížení" počítá se stejnou efektivní kapacitou po odečtení nepřítomných '
+        'zaměstnanců jako KPI dlaždice a přehled výše — na rozdíl od "vytížení" (proti nainstalované '
+        'kapacitě) tak ukazuje, jak moc je pracoviště využité vůči tomu, co bylo reálně k dispozici.</p>'
+        if has_effective_capacity else ""
     )
 
     gran_container_id = f"gran-{branch_id}-{'-'.join(str(i) for i in ws_ids) if ws_ids else 'all'}"
@@ -1665,6 +1716,7 @@ def render_branch_body(
 
       <h3>Vytíženost jednotlivých pracovišť (celé období)</h3>
       {ws_table_html}
+      {ws_real_note_html}
 
       <h3 style="margin-top:26px">Vytíženost v čase</h3>
       <p class="note">Přepínač Hodiny/Dny/Týdny/Měsíce mění úroveň agregace stejného grafu. "Hodiny" ukazuje
@@ -1903,10 +1955,13 @@ def build_html_report(
       <span><i style="background:{BUCKET_COLORS['Kritická']}"></i>Kritická (&gt; {THRESHOLD_CRITICAL:.0f} %)</span>
     </div>
     <div class="table-scroll">{branch_table_html}</div>
-    <p class="note">Vytíženost pobočky = odpracované minuty / (počet pracovišť × kapacita pracoviště v min/den),
-    zprůměrováno přes dny, kdy je pobočka otevřená, ve sledovaném období. Denní kapacita pracoviště se počítá
-    z týdenní otevírací doby (CAPACITY) dělené počtem otevřených dní v týdnu (5, nebo 7 pro víkendové pobočky).
-    Pobočky bez dat v bo_data.xlsx jsou uvedeny se stavem „Bez dat". Klikněte na řádek pobočky pro její detail níže.</p>
+    <p class="note">Reálné vytížení pobočky = odpracované minuty / (počet pracovišť × EFEKTIVNÍ kapacita pracoviště
+    v min/den), zprůměrováno přes dny, kdy je pobočka otevřená, ve sledovaném období. Denní kapacita pracoviště se
+    počítá z týdenní otevírací doby (CAPACITY) dělené počtem otevřených dní v týdnu (5, nebo 7 pro víkendové
+    pobočky). U pilotní pobočky (Olbrachtova) je efektivní kapacita nominální kapacita snížená o nepřítomné
+    zaměstnance (dovolená, nemoc, home office, …) — u ostatních poboček bez dat o nepřítomnosti je efektivní
+    kapacita rovna nominální. Pobočky bez dat v bo_data.xlsx jsou uvedeny se stavem „Bez dat". Klikněte na řádek
+    pobočky pro její detail níže.</p>
 
     <h3 style="margin-top:26px">Kalendářní přehled vytíženosti (všechny pobočky dohromady)</h3>
     <p class="note">Sytost zelené = kombinovaná vytíženost všech poboček daný den (odpracované minuty vůči
@@ -1969,7 +2024,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18d (Nepřítomnosti: scope podle seznamu zaměstnanců (OSC), ne podle Zkratka organizační jednotky — ta je domovská HR jednotka, ne fyzická pobočka)"
+SCRIPT_VERSION = "2026-07-18e (Reálné vytížení vůči efektivní kapacitě: úvodní tabulka přejmenována + nové sloupce u vytížení jednotlivých pracovišť)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
