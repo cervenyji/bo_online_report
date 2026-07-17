@@ -446,14 +446,27 @@ ABSENCE_TYPES_COUNTED = [
 ABSENCE_STATUS_COUNTED = "APPROVED"
 
 
-def load_absences(path, org_unit_zkratka, valid_dates=None, capacity_day_hours=8.0):
+def load_absences(path, org_unit_zkratka, employees=None, valid_dates=None, capacity_day_hours=8.0):
     """Načte export nepřítomností z HR systému (Nepřítomnosti.xlsx). Před hlavičkou
     bývá pár řádků metadat ("Exportováno do formátu Excel dne...") - jejich přesný
     počet se mezi exporty může lišit, proto se řádek s hlavičkou hledá automaticky
-    (první řádek obsahující 'Příjmení'), místo pevného skiprows. Filtruje na
-    `org_unit_zkratka` (pilotní pobočka), na typy nepřítomnosti z
-    ABSENCE_TYPES_COUNTED a na stav žádosti ABSENCE_STATUS_COUNTED (schválené) -
-    ostatní typy (např. náhrada mzdy) ani neschválené žádosti se nepočítají.
+    (první řádek obsahující 'Příjmení'), místo pevného skiprows.
+
+    Koho se nepřítomnost týká: sloupec 'Zkratka organizační jednotky' v exportu
+    nepřítomností odpovídá FORMÁLNÍ/domovské organizační jednotce zaměstnance
+    v HR systému, NE fyzické pobočce, kde reálně pracuje - zaměstnanci pilotní
+    pobočky (Olbrachtova) tak v tomto sloupci běžně mají úplně jinou hodnotu než
+    `org_unit_zkratka` (pozorováno: zaměstnanec z autoritativního seznamu
+    "zamestnanci" s org. jednotkou jiné pobočky). Filtrovat podle téhle zkratky
+    by proto reálné pilotní zaměstnance nesprávně vyřadilo. Pokud je k dispozici
+    autoritativní seznam `employees` (list "zamestnanci", sloupec OSC), použije
+    se ten - spáruje se podle 'Osobní číslo' (jednoznačné, na rozdíl od jména
+    necitlivé na diakritiku/pořadí). `org_unit_zkratka` slouží jen jako záložní
+    filtr, když seznam zaměstnanců není k dispozici.
+
+    Dál filtruje na typy nepřítomnosti z ABSENCE_TYPES_COUNTED a na stav žádosti
+    ABSENCE_STATUS_COUNTED (schválené) - ostatní typy (např. náhrada mzdy) ani
+    neschválené žádosti se nepočítají.
 
     Nepřítomnost se rozprostírá jen na PRACOVNÍ dny (Po-Pá), a pokud je zadané
     `valid_dates` (dny, které se skutečně objevují v datech aktivit budovy, na
@@ -472,7 +485,7 @@ def load_absences(path, org_unit_zkratka, valid_dates=None, capacity_day_hours=8
     Vrátí denní tabulku EMPLOYEE×DATE s podílem dne (ABSENCE_FRACTION, 0-1),
     kdy zaměstnanec nebyl k dispozici a nemohl použít žádné pracoviště."""
     needed = [
-        "Příjmení", "Jméno", "Zkratka organizační jednotky", "Začátek - datum", "Konec - datum",
+        "Osobní číslo", "Příjmení", "Jméno", "Zkratka organizační jednotky", "Začátek - datum", "Konec - datum",
         "Začátek - čas", "Konec - čas", "Počet dní", "Počet hodin", "Typ nepřítomnosti", "Stav žádosti",
     ]
     try:
@@ -491,8 +504,14 @@ def load_absences(path, org_unit_zkratka, valid_dates=None, capacity_day_hours=8
     if missing:
         raise ValueError(f"V souboru {path} chybí očekávané sloupce: {missing}")
 
+    if employees is not None and not employees.empty:
+        roster_osc = set(pd.to_numeric(employees["OSC"], errors="coerce").dropna().astype(int))
+        scope_mask = pd.to_numeric(raw["Osobní číslo"], errors="coerce").isin(roster_osc)
+    else:
+        scope_mask = raw["Zkratka organizační jednotky"] == org_unit_zkratka
+
     df = raw.loc[
-        (raw["Zkratka organizační jednotky"] == org_unit_zkratka)
+        scope_mask
         & (raw["Typ nepřítomnosti"].isin(ABSENCE_TYPES_COUNTED))
         & (raw["Stav žádosti"] == ABSENCE_STATUS_COUNTED)
     ].copy()
@@ -1950,7 +1969,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18c (Čtení bo_data.xlsx/qr_codes_bo_online.xlsx podle jména sloupce a listu 'data', ne podle pozice — odolné vůči novým sloupcům v exportu)"
+SCRIPT_VERSION = "2026-07-18d (Nepřítomnosti: scope podle seznamu zaměstnanců (OSC), ne podle Zkratka organizační jednotky — ta je domovská HR jednotka, ne fyzická pobočka)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
@@ -1988,7 +2007,7 @@ else:
     _absence_capacity_day_hours = 8.0
     _absence_valid_dates = None
 absences = load_absences(
-    ABSENCE_FILE, PILOT_ORG_UNIT_ZKRATKA,
+    ABSENCE_FILE, PILOT_ORG_UNIT_ZKRATKA, employees=employees,
     valid_dates=_absence_valid_dates, capacity_day_hours=_absence_capacity_day_hours,
 )
 print(f"Nepřítomnosti (pilotní pobočka {PILOT_ORG_UNIT_ZKRATKA}): {len(absences)} záznamů (zaměstnanec×den)")
