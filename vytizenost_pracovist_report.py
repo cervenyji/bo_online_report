@@ -36,7 +36,9 @@ from IPython.display import IFrame, display
 # -----------------------------------------------------------------------------
 
 BO_DATA_FILE = "bo_data.xlsx"
+ACTIVITIES_SHEET_NAME = "data"  # list s aktivitami uvnitř bo_data.xlsx
 WORKSPACES_FILE = "qr_codes_bo_online.xlsx"
+WORKSPACES_SHEET_NAME = "data"  # list s pobočkami uvnitř qr_codes_bo_online.xlsx
 SEGMENTS_FILE = WORKSPACES_FILE  # segmenty (BRANCH_ID, PRACOVISTE_ID, SEGMENT) bývají jako list
 SEGMENTS_SHEET_NAME = "struktura_pracovist_segmenty"  # uvnitř qr_codes_bo_online.xlsx, ne samostatný soubor
 EMPLOYEES_FILE = BO_DATA_FILE  # celkový seznam zaměstnanců (OSC, PRIJMENI, JMENO) bývá jako list uvnitř bo_data.xlsx
@@ -252,8 +254,10 @@ def _parse_datetime_cell(value):
 def _parse_time_cell(value):
     """Buňka typu 'Začátek - čas'/'Konec - čas' může přijít jako skutečný Excel čas
     (naše čtečka ho vrátí jako datetime s datem 1899-12-30 - jen čas je platný),
-    jako holé číslo (zlomek dne, když styl nebyl rozpoznán jako datum/čas), nebo
-    jako text ('08:00', '08:00:00'). Vrátí datetime.time, nebo None."""
+    jako holé číslo (zlomek dne, když styl nebyl rozpoznán jako datum/čas), jako
+    prostý čas v textu ('08:00', '08:00:00'), nebo jako celé datum v textu ukotvené
+    na libovolném dni ('1/1/1970 8:00:00 AM' — reálně pozorovaný formát exportu z HR
+    systému). Vrátí datetime.time, nebo None."""
     if isinstance(value, datetime):
         return value.time()
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -267,20 +271,37 @@ def _parse_time_cell(value):
             return datetime.strptime(text, fmt).time()
         except ValueError:
             continue
-    return None
+    parsed = pd.to_datetime(text, errors="coerce")
+    return parsed.time() if pd.notna(parsed) else None
 
 
-def load_activities(path):
-    """Načte bo_data.xlsx, sjednotí názvy sloupců (dle pozice, ne dle přesného
-    znění hlavičky) a vrátí (očištěná_data, řádky_s_problémem)."""
-    raw = read_xlsx(path)
-    if raw.shape[1] < 6:
+ACTIVITIES_COLUMNS = {
+    "Pobočka": "BRANCH_ID",
+    "Pracoviště": "WORKSTATION_ID",
+    "Datum a čas": "DATETIME_RAW",
+    "Zaměstnanec": "EMPLOYEE",
+    "Činnost": "ACTIVITY",
+    "Trvání činnosti": "DURATION_MIN",
+}
+
+
+def load_activities(path, sheet_name=ACTIVITIES_SHEET_NAME):
+    """Načte bo_data.xlsx a vybere potřebné sloupce PODLE JMÉNA hlavičky (ne podle
+    pozice) - export může mezitím přibrat další sloupce (např. 'Osobní číslo',
+    'Oddělení'), které by pozicní čtení tiše rozhodilo. Vrátí
+    (očištěná_data, řádky_s_problémem)."""
+    try:
+        raw = read_xlsx(path, sheet_index=sheet_name)
+    except SheetNotFoundError:
+        raw = read_xlsx(path)  # starší export bez pojmenovaného listu - vezme první list
+
+    missing = [c for c in ACTIVITIES_COLUMNS if c not in raw.columns]
+    if missing:
         raise ValueError(
-            f"Soubor {path} má jen {raw.shape[1]} sloupců, očekává se 6: "
-            "BRANCH_ID, PRACOVISTE_ID, DATETIME, ZAMESTNANEC, ACTIVITY, DURATION"
+            f"V souboru {path} (list '{sheet_name}') chybí očekávané sloupce: {missing}. "
+            f"Nalezené sloupce: {list(raw.columns)}"
         )
-    df = raw.iloc[:, :6].copy()
-    df.columns = ["BRANCH_ID", "WORKSTATION_ID", "DATETIME_RAW", "EMPLOYEE", "ACTIVITY", "DURATION_MIN"]
+    df = raw[list(ACTIVITIES_COLUMNS)].rename(columns=ACTIVITIES_COLUMNS).copy()
 
     df["BRANCH_ID"] = pd.to_numeric(df["BRANCH_ID"], errors="coerce")
     df["WORKSTATION_ID"] = pd.to_numeric(df["WORKSTATION_ID"], errors="coerce")
@@ -314,18 +335,32 @@ def _coerce_bool(series):
     return series.map(_one)
 
 
-def load_workspaces(path):
-    """Načte work_spaces.xlsx a sjednotí názvy sloupců dle pozice. CAPACITY je
-    týdenní otevírací doba v hodinách — denní kapacita se odvozuje podle toho,
-    jestli je pobočka otevřená i o víkendu (VIKENDOVA)."""
-    raw = read_xlsx(path)
-    if raw.shape[1] < 6:
+WORKSPACES_COLUMNS = {
+    "BRANCH_ID": "BRANCH_ID",
+    "BRANCH_NAME": "BRANCH_NAME",
+    "NO_WPL": "NO_WORKSTATIONS",
+    "CAPACITY": "CAPACITY_WEEK_HOURS",
+    "VIKENDOVA": "VIKENDOVA",
+    "POLEDNI_PAUZA": "POLEDNI_PAUZA",
+}
+
+
+def load_workspaces(path, sheet_name=WORKSPACES_SHEET_NAME):
+    """Načte work_spaces.xlsx a vybere potřebné sloupce PODLE JMÉNA hlavičky (ne
+    podle pozice). CAPACITY je týdenní otevírací doba v hodinách — denní kapacita
+    se odvozuje podle toho, jestli je pobočka otevřená i o víkendu (VIKENDOVA)."""
+    try:
+        raw = read_xlsx(path, sheet_index=sheet_name)
+    except SheetNotFoundError:
+        raw = read_xlsx(path)  # starší export bez pojmenovaného listu - vezme první list
+
+    missing = [c for c in WORKSPACES_COLUMNS if c not in raw.columns]
+    if missing:
         raise ValueError(
-            f"Soubor {path} má jen {raw.shape[1]} sloupců, očekává se 6: "
-            "BRANCH_ID, BRANCH_NAME, NO_WPL, CAPACITY, VIKENDOVA, POLEDNI_PAUZA"
+            f"V souboru {path} (list '{sheet_name}') chybí očekávané sloupce: {missing}. "
+            f"Nalezené sloupce: {list(raw.columns)}"
         )
-    df = raw.iloc[:, :6].copy()
-    df.columns = ["BRANCH_ID", "BRANCH_NAME", "NO_WORKSTATIONS", "CAPACITY_WEEK_HOURS", "VIKENDOVA", "POLEDNI_PAUZA"]
+    df = raw[list(WORKSPACES_COLUMNS)].rename(columns=WORKSPACES_COLUMNS).copy()
     df["BRANCH_ID"] = pd.to_numeric(df["BRANCH_ID"], errors="coerce")
     df["NO_WORKSTATIONS"] = pd.to_numeric(df["NO_WORKSTATIONS"], errors="coerce")
     df["CAPACITY_WEEK_HOURS"] = pd.to_numeric(df["CAPACITY_WEEK_HOURS"], errors="coerce")
@@ -335,7 +370,7 @@ def load_workspaces(path):
     bad_mask = df["BRANCH_ID"].isna() | df["NO_WORKSTATIONS"].isna() | df["CAPACITY_WEEK_HOURS"].isna()
     if bad_mask.any():
         print(f"Pozor: {bad_mask.sum()} řádků ve work_spaces.xlsx bylo přeskočeno (chybí BRANCH_ID/NO_WPL/CAPACITY):")
-        display(raw.iloc[:, :6].loc[bad_mask])
+        display(raw.loc[bad_mask])
     df = df.loc[~bad_mask].copy()
 
     df["BRANCH_ID"] = df["BRANCH_ID"].astype(int)
@@ -1915,7 +1950,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18b (Nepřítomnosti: Počet hodin + Začátek/Konec - čas, rozprostření jen na pracovní dny v datech aktivit, odečítání kapacity jen pro Olbrachtovu)"
+SCRIPT_VERSION = "2026-07-18c (Čtení bo_data.xlsx/qr_codes_bo_online.xlsx podle jména sloupce a listu 'data', ne podle pozice — odolné vůči novým sloupcům v exportu)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
