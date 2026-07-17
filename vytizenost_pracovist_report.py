@@ -1740,24 +1740,34 @@ def build_html_report(
 ):
     generated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    overall_util = branch_daily["UTILIZATION_PCT"].mean()
     total_hours = merged["DURATION_MIN"].sum() / 60
     n_branches_with_data = merged["BRANCH_ID"].nunique()
     n_branches_total = workspaces["BRANCH_ID"].nunique()
     n_workstations_registered = int(workspaces["NO_WORKSTATIONS"].sum())
     n_employees = merged["EMPLOYEE"].nunique()
 
-    daily_all = branch_daily.groupby("DATE").agg(UTILIZATION_PCT=("UTILIZATION_PCT", "mean"), DURATION_MIN=("DURATION_MIN", "sum")).sort_index()
-    util_series = daily_all["UTILIZATION_PCT"].tolist()
-    hours_series = (daily_all["DURATION_MIN"] / 60).tolist()
+    # Přehled všech poboček (build_front_page_summary/build_combined_daily_calendar_data)
+    # se počítá už tady (ne až níž u sekce "Přehled všech poboček"), protože titulní
+    # KPI dlaždice "Prům. reálné vytížení poboček" z nich čerpá — musí ukazovat STEJNÉ
+    # číslo jako tabulka pod ním (u pilotní budovy Olbrachtova počítané vůči efektivní,
+    # nepřítomností snížené kapacitě), ne hrubý průměr z branch_daily, který pilotní
+    # pobočku počítá jako jednu budovu o 20 pracovištích (včetně nenainstalované
+    # Jugoslávské) vůči nominální kapacitě — to dřív dávalo jiné (nižší, neefektivní) číslo.
+    front_page_summary = build_front_page_summary(branch_summary, merged, absences, employees)
+    combined_daily, activity_mix_by_date, absence_count_by_date = build_combined_daily_calendar_data(branch_daily, merged, absences, employees)
+
+    overall_util = front_page_summary["PRUMERNA_VYTIZENOST_PCT"].mean()
+    combined_daily_sorted = combined_daily.sort_values("DATE")
+    util_series = combined_daily_sorted["UTILIZATION_PCT"].tolist()
+    hours_series = (combined_daily_sorted["DURATION_MIN"] / 60).tolist()
 
     cards = f"""
     <div class="card-row">
       {_stat_tile("Sledované období", f'{period_start:%d.%m.%Y} – {period_end:%d.%m.%Y}')}
       {_stat_tile(
-          "Průměrná vytíženost poboček", f"{overall_util:.1f} %",
+          "Prům. reálné vytížení poboček", f"{overall_util:.1f} %",
           delta_pct=_trend_delta_pct(util_series), spark_values=util_series, spark_color=BLUE,
-          tooltip="Průměr denní vytíženosti přes všechny pobočky s daty",
+          tooltip="Průměr reálné (efektivní kapacitou po odečtení nepřítomných) vytíženosti přes všechny pobočky s daty",
       )}
       {_stat_tile(
           "Odpracované hodiny celkem", f"{total_hours:,.0f} h",
@@ -1792,10 +1802,8 @@ def build_html_report(
     # --- Přehled všech poboček (jediné, co zůstává na titulní straně) ----------
     # Pilotní pobočka (PILOT_BRANCH_ID) se tu rozděluje na dvě budovy s vlastní
     # (efektivní, nepřítomností sníženou) kapacitou — viz build_front_page_summary.
-    front_page_summary = build_front_page_summary(branch_summary, merged, absences, employees)
+    # front_page_summary/combined_daily jsou už spočítané výš (kvůli titulní KPI dlaždici).
     branch_table_html = build_branch_overview_table_html(front_page_summary)
-
-    combined_daily, activity_mix_by_date, absence_count_by_date = build_combined_daily_calendar_data(branch_daily, merged, absences, employees)
     calendar_html = build_month_calendar_html(combined_daily, activity_mix_by_date, absence_count_by_date)
 
     # --- Rozbalovací karta pro každou pobočku -----------------------------------
@@ -2024,7 +2032,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18e (Reálné vytížení vůči efektivní kapacitě: úvodní tabulka přejmenována + nové sloupce u vytížení jednotlivých pracovišť)"
+SCRIPT_VERSION = "2026-07-18f (Titulní KPI dlaždice 'Prům. reálné vytížení poboček' sesynchronizována s tabulkou 'Přehled všech poboček' - stejný zdroj dat)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
