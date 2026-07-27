@@ -1,0 +1,145 @@
+.center-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100svh;
+  font-size: 20px;
+}
+
+.auth-card {
+  max-width: 420px;
+  margin: 60px auto;
+  padding: 32px;
+  text-align: left;
+}
+
+.auth-card h1 {
+  font-size: 32px;
+  margin: 0 0 8px;
+  text-align: center;
+}
+
+.subtitle {
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.auth-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.auth-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.auth-card input,
+.auth-card select {
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.auth-card button[type='submit'] {
+  font: inherit;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  margin-top: 8px;
+}
+
+.google-btn {
+  width: 100%;
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-h);
+  cursor: pointer;
+  margin-top: 12px;
+}
+
+.link-btn {
+  display: block;
+  width: 100%;
+  text-align: center;
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  margin-top: 16px;
+  padding: 4px;
+}
+
+.error {
+  color: #e5484d;
+  font-size: 14px;
+}
+
+.dashboard {
+  max-width: 600px;
+  margin: 60px auto;
+  padding: 32px;
+  text-align: left;
+}
+
+.dashboard header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.dashboard header h1 {
+  font-size: 32px;
+  margin: 0;
+}
+
+.dashboard header .link-btn {
+  width: auto;
+  margin: 0;
+}
+
+.stats {
+  display: flex;
+  gap: 24px;
+  margin-top: 24px;
+}
+
+.stat {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.stat .label {
+  display: block;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.stat .value {
+  display: block;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text-h);
+  margin-top: 4px;
+}
+
+.placeholder-note {
+  margin-top: 32px;
+  font-size: 14px;
+  color: var(--text);
+}
