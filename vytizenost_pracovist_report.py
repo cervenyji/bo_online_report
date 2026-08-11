@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import re
 import unicodedata
@@ -61,7 +62,9 @@ DAYS_PER_WEEK_OPEN_WEEKEND = 7
 # Zároveň je tahle pobočka fyzicky rozdělená na dvě budovy s jiným číslováním
 # pracovišť - platí to VÝHRADNĚ pro PILOT_BRANCH_ID, nikde jinde v kódu se to
 # nezobecňuje.
-ABSENCE_FILE = "2026071_14_Nepřítomnosti.xlsx"  # export z HR systému - název souboru se mění dle exportu, upravte
+ABSENCE_FILE_GLOB = "*Nepřítomnosti*.xlsx"  # export(y) z HR systému - nový export dostane nový název
+# (např. "..._14_..." -> "..._15_..."), proto se místo jednoho pevného jména používá vzor - všechny
+# soubory, které mu odpovídají, se načtou a zkombinují (duplicitní žádosti napříč soubory se zahodí).
 PILOT_BRANCH_ID = 459  # Praha 2 (Jugoslávská)
 PILOT_ORG_UNIT_ZKRATKA = "UP_459"  # filtr sloupce 'Zkratka organizační jednotky' v souboru nepřítomností
 PILOT_BUILDINGS = {
@@ -447,10 +450,15 @@ ABSENCE_TYPES_COUNTED = [
 ABSENCE_STATUS_COUNTED = "APPROVED"
 
 
-def load_absences(path, org_unit_zkratka, employees=None, valid_dates=None, capacity_day_hours=8.0):
-    """Načte export nepřítomností z HR systému (Nepřítomnosti.xlsx). Před hlavičkou
-    bývá pár řádků metadat ("Exportováno do formátu Excel dne...") - jejich přesný
-    počet se mezi exporty může lišit, proto se řádek s hlavičkou hledá automaticky
+def load_absences(path_glob, org_unit_zkratka, employees=None, valid_dates=None, capacity_day_hours=8.0):
+    """Načte export(y) nepřítomností z HR systému. `path_glob` je vzor jména
+    souboru (např. "*Nepřítomnosti*.xlsx") - odpovídat mu může i více souborů
+    najednou (nový export dostane nový název, např. "..._14_..." vs "..._15_...").
+    Všechny odpovídající soubory se načtou a zkombinují; řádky, které jsou mezi
+    soubory přesně duplicitní (typicky když novější export obsahuje i starší
+    žádosti), se započítají jen jednou. Před hlavičkou v každém souboru bývá pár
+    řádků metadat ("Exportováno do formátu Excel dne...") - jejich přesný počet
+    se mezi exporty může lišit, proto se řádek s hlavičkou hledá automaticky
     (první řádek obsahující 'Příjmení'), místo pevného skiprows.
 
     Koho se nepřítomnost týká: sloupec 'Zkratka organizační jednotky' v exportu
@@ -489,21 +497,38 @@ def load_absences(path, org_unit_zkratka, employees=None, valid_dates=None, capa
         "Osobní číslo", "Příjmení", "Jméno", "Zkratka organizační jednotky", "Začátek - datum", "Konec - datum",
         "Začátek - čas", "Konec - čas", "Počet dní", "Počet hodin", "Typ nepřítomnosti", "Stav žádosti",
     ]
-    try:
-        rows = read_xlsx_rows(path)
-    except (FileNotFoundError, zipfile.BadZipFile):
-        print(f"Pozor: soubor s nepřítomnostmi '{path}' nebyl nalezen — sekce nepřítomnosti se vynechá.")
+    paths = sorted(glob.glob(path_glob))
+    if not paths:
+        print(f"Pozor: žádný soubor s nepřítomnostmi neodpovídá vzoru '{path_glob}' — sekce nepřítomnosti se vynechá.")
         return pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
 
-    header_row = next((i for i, r in enumerate(rows[:10]) if "Příjmení" in r), None)
-    if header_row is None:
-        raise ValueError(f"V souboru {path} se v prvních 10 řádcích nenašla hlavička (sloupec 'Příjmení').")
-    header, *data = rows[header_row:]
-    raw = pd.DataFrame(data, columns=header)
+    raw_frames = []
+    for path in paths:
+        try:
+            rows = read_xlsx_rows(path)
+        except zipfile.BadZipFile:
+            print(f"Pozor: soubor s nepřítomnostmi '{path}' se nepodařilo přečíst (poškozený/neplatný .xlsx) — přeskočen.")
+            continue
 
-    missing = [c for c in needed if c not in raw.columns]
+        header_row = next((i for i, r in enumerate(rows[:10]) if "Příjmení" in r), None)
+        if header_row is None:
+            raise ValueError(f"V souboru {path} se v prvních 10 řádcích nenašla hlavička (sloupec 'Příjmení').")
+        header, *data = rows[header_row:]
+        raw_frames.append(pd.DataFrame(data, columns=header))
+
+    if not raw_frames:
+        return pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
+
+    missing = [c for c in needed if not all(c in f.columns for f in raw_frames)]
     if missing:
-        raise ValueError(f"V souboru {path} chybí očekávané sloupce: {missing}")
+        raise ValueError(f"V souborech {paths} chybí očekávané sloupce: {missing}")
+
+    n_before_dedup = sum(len(f) for f in raw_frames)
+    raw = pd.concat(raw_frames, ignore_index=True).drop_duplicates()
+    print(
+        f"Nepřítomnosti: načteno {len(paths)} soubor(ů) ({', '.join(paths)}), "
+        f"{n_before_dedup} řádků celkem, {len(raw)} po odstranění duplicit napříč soubory."
+    )
 
     if employees is not None and not employees.empty:
         roster_osc = set(pd.to_numeric(employees["OSC"], errors="coerce").dropna().astype(int))
@@ -520,8 +545,12 @@ def load_absences(path, org_unit_zkratka, employees=None, valid_dates=None, capa
         return pd.DataFrame(columns=["EMPLOYEE", "DATE", "ABSENCE_FRACTION"])
 
     df["EMPLOYEE"] = df["Příjmení"].astype(str).str.strip() + " " + df["Jméno"].astype(str).str.strip()
-    start = pd.to_datetime(df["Začátek - datum"]).dt.normalize()
-    end = pd.to_datetime(df["Konec - datum"]).dt.normalize()
+    # dayfirst=True: pro případ, že by "Začátek/Konec - datum" v některém exportu
+    # přišly jako TEXT (ne jako skutečná Excel data) - u dnů <= 12 by jinak hrozila
+    # záměna dne a měsíce (např. "06.07.2026" by se bez dayfirst přečetlo jako
+    # 7. června, ne 6. července). Na skutečné datumové buňky (Timestamp) nemá vliv.
+    start = pd.to_datetime(df["Začátek - datum"], dayfirst=True).dt.normalize()
+    end = pd.to_datetime(df["Konec - datum"], dayfirst=True).dt.normalize()
     pocet_dni = pd.to_numeric(df["Počet dní"], errors="coerce")
     pocet_hodin = pd.to_numeric(df["Počet hodin"], errors="coerce")
     start_time = df["Začátek - čas"].map(_parse_time_cell)
@@ -2203,7 +2232,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18g (Klik na den v kalendáři otevře popup s denním rozvrhem pracovišť po 10 min, barevně dle aktivit)"
+SCRIPT_VERSION = "2026-07-18h (Nepřítomnosti: více exportních souborů dle vzoru ABSENCE_FILE_GLOB se zkombinuje a deduplikuje, ne jen jeden pevný název)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
@@ -2241,7 +2270,7 @@ else:
     _absence_capacity_day_hours = 8.0
     _absence_valid_dates = None
 absences = load_absences(
-    ABSENCE_FILE, PILOT_ORG_UNIT_ZKRATKA, employees=employees,
+    ABSENCE_FILE_GLOB, PILOT_ORG_UNIT_ZKRATKA, employees=employees,
     valid_dates=_absence_valid_dates, capacity_day_hours=_absence_capacity_day_hours,
 )
 print(f"Nepřítomnosti (pilotní pobočka {PILOT_ORG_UNIT_ZKRATKA}): {len(absences)} záznamů (zaměstnanec×den)")
