@@ -309,13 +309,22 @@ def load_activities(path, sheet_name=ACTIVITIES_SHEET_NAME):
 
     df["BRANCH_ID"] = pd.to_numeric(df["BRANCH_ID"], errors="coerce")
     df["WORKSTATION_ID"] = pd.to_numeric(df["WORKSTATION_ID"], errors="coerce")
-    df["DURATION_MIN"] = pd.to_numeric(df["DURATION_MIN"], errors="coerce")
+
+    # "Trvání činnosti" může místo počtu minut obsahovat text "Celý den" - pracoviště
+    # je pak obsazené po celou otevírací dobu pobočky. Přesnou hodnotu v minutách
+    # (kapacita pracoviště/den) ale známe až po spojení s work_spaces.xlsx, proto se
+    # tu jen označí příznakem IS_FULL_DAY a doplní v merge_activities_with_workspaces().
+    duration_raw = df["DURATION_MIN"]
+    is_full_day = duration_raw.astype(str).str.strip().str.casefold() == "celý den"
+    df["IS_FULL_DAY"] = is_full_day
+    df["DURATION_MIN"] = pd.to_numeric(duration_raw.mask(is_full_day), errors="coerce")
+
     df["DATETIME"] = pd.to_datetime(df["DATETIME_RAW"].map(_parse_datetime_cell), errors="coerce")
     df["DATE"] = df["DATETIME"].dt.normalize()
 
     bad_mask = (
         df["BRANCH_ID"].isna() | df["WORKSTATION_ID"].isna() | df["DATETIME"].isna()
-        | df["DURATION_MIN"].isna() | (df["DURATION_MIN"] <= 0)
+        | (~df["IS_FULL_DAY"] & (df["DURATION_MIN"].isna() | (df["DURATION_MIN"] <= 0)))
     )
     issues = df.loc[bad_mask].copy()
     clean = df.loc[~bad_mask].copy()
@@ -609,10 +618,17 @@ def compute_absence_daily(absences, employee_base):
 
 
 def merge_activities_with_workspaces(activities, workspaces):
-    """Připojí k aktivitám info o pobočce. Vrátí (spojená_data, aktivity_z_neznámé_pobočky)."""
+    """Připojí k aktivitám info o pobočce. Vrátí (spojená_data, aktivity_z_neznámé_pobočky).
+    Aktivity označené jako IS_FULL_DAY ("Celý den" místo počtu minut, viz load_activities)
+    tady dostanou skutečnou DURATION_MIN = kapacita PRACOVIŠTĚ/den té pobočky (CAPACITY_MIN,
+    z work_spaces.xlsx) - tu jsme dřív neznali, protože load_activities pracuje bez
+    workspaces."""
     merged = activities.merge(workspaces, on="BRANCH_ID", how="left", indicator=True)
     unknown = merged.loc[merged["_merge"] == "left_only"].copy()
     known = merged.loc[merged["_merge"] == "both"].drop(columns="_merge").copy()
+    if "IS_FULL_DAY" in known.columns:
+        full_day_mask = known["IS_FULL_DAY"].fillna(False)
+        known.loc[full_day_mask, "DURATION_MIN"] = known.loc[full_day_mask, "CAPACITY_MIN"]
     return known.reset_index(drop=True), unknown.reset_index(drop=True)
 
 
@@ -765,6 +781,27 @@ def compute_capacity_growth_flags(merged, workspaces):
     out["ROZDIL"] = out["POUZITA_PRACOVISTE"] - out["NO_WORKSTATIONS"]
     out["PREKROCENO"] = out["ROZDIL"] > 0
     return out.sort_values("ROZDIL", ascending=False).reset_index(drop=True)
+
+
+def compute_full_day_duplicate_warnings(merged):
+    """Najde pracoviště, kde je v jeden den zadáno VÍC aktivit "Celý den" najednou
+    (viz load_activities/IS_FULL_DAY) - fyzicky nedává smysl, aby jedno pracoviště
+    bylo obsazené na celý den víckrát (typicky duplicitní zápis, nebo si stejné
+    pracoviště na celý den nárokuje víc lidí). Vrátí přehled k zobrazení jako
+    upozornění v reportu; prázdný DataFrame, pokud k ničemu takovému nedošlo."""
+    cols = ["BRANCH_NAME", "WORKSTATION_ID", "DATE", "POCET", "ZAMESTNANCI"]
+    if "IS_FULL_DAY" not in merged.columns:
+        return pd.DataFrame(columns=cols)
+    full_day = merged.loc[merged["IS_FULL_DAY"].fillna(False)]
+    if full_day.empty:
+        return pd.DataFrame(columns=cols)
+
+    grouped = full_day.groupby(["BRANCH_NAME", "WORKSTATION_ID", "DATE"]).agg(
+        POCET=("EMPLOYEE", "count"),
+        ZAMESTNANCI=("EMPLOYEE", lambda s: ", ".join(sorted(set(s)))),
+    ).reset_index()
+    dup = grouped.loc[grouped["POCET"] > 1]
+    return dup.sort_values(["DATE", "BRANCH_NAME", "WORKSTATION_ID"]).reset_index(drop=True)[cols]
 
 
 def compute_activity_breakdown(merged):
@@ -1420,6 +1457,30 @@ def build_month_calendar_html(daily_combined, activity_mix_by_date, absence_coun
     </div>"""
 
 
+def build_full_day_duplicate_warning_html(dup_df):
+    """Upozornění (jen pokud je na co upozorňovat) na pracoviště, kde je v jeden
+    den zadáno víc aktivit "Celý den" najednou - viz compute_full_day_duplicate_warnings."""
+    if dup_df.empty:
+        return ""
+    rows_html = "".join(
+        f"<tr><td>{r['BRANCH_NAME']}</td><td>{int(r['WORKSTATION_ID'])}</td>"
+        f"<td>{r['DATE']:%d.%m.%Y}</td><td>{int(r['POCET'])}×</td><td>{r['ZAMESTNANCI']}</td></tr>"
+        for _, r in dup_df.iterrows()
+    )
+    return f"""
+  <div class="section" style="border-left:3px solid {STATUS_WARNING}">
+    <h2>⚠️ Pracoviště zadaná vícekrát na celý den</h2>
+    <p class="note">Tato pracoviště mají v jeden den zapsané víc aktivit "Celý den" najednou —
+    fyzicky nemůže být jedno pracoviště obsazené na celý den víckrát, jde nejspíš o duplicitní
+    nebo chybný zápis (případně si stejné pracoviště na celý den nárokuje víc lidí). Zkontrolujte
+    v bo_data.xlsx.</p>
+    <table class="report">
+      <thead><tr><th>Pobočka</th><th>Pracoviště</th><th>Datum</th><th>Počet zápisů</th><th>Zaměstnanci</th></tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+  </div>"""
+
+
 def build_branch_overview_table_html(front_page_summary):
     """Ruční tabulka (místo _df_to_html_table) — celý řádek je klikatelný a
     naviguje na ukotvení detailu dané pobočky (#branch-{id}); nativní chování
@@ -1927,6 +1988,9 @@ def build_html_report(
     branch_table_html = build_branch_overview_table_html(front_page_summary)
     calendar_html = build_month_calendar_html(combined_daily, activity_mix_by_date, absence_count_by_date)
 
+    full_day_duplicates = compute_full_day_duplicate_warnings(merged)
+    full_day_warning_html = build_full_day_duplicate_warning_html(full_day_duplicates)
+
     # Podklad pro popup "Denní rozvrh pracovišť" (klik na den v kalendáři výše) -
     # embedovaný jako JSON, vykreslovaný v JS (viz openDayDetail() v <script> níže).
     day_slots, day_slot_labels, day_activity_color = compute_day_workstation_slots(merged)
@@ -2084,6 +2148,8 @@ def build_html_report(
 
   {cards}
 
+  {full_day_warning_html}
+
   <div class="section">
     <h2>Přehled všech poboček</h2>
     <div class="legend">
@@ -2232,7 +2298,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18h (Nepřítomnosti: více exportních souborů dle vzoru ABSENCE_FILE_GLOB se zkombinuje a deduplikuje, ne jen jeden pevný název)"
+SCRIPT_VERSION = "2026-07-18i ('Celý den' v Trvání činnosti = celá otevírací kapacita pracoviště/den + upozornění na duplicitní 'Celý den' zápisy)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
