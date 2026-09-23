@@ -288,6 +288,16 @@ ACTIVITIES_COLUMNS = {
     "Trvání činnosti": "DURATION_MIN",
 }
 
+FULL_DAY_MARKER = "celý den"  # hodnota "Trvání činnosti" u aktivit na celý den (viz load_activities)
+
+
+def _fold_no_diacritics(text):
+    """Sjednotí text pro porovnání bez ohledu na velikost písmen i diakritiku
+    ('Celý den', 'CELÝ DEN', 'Cely den', '  celý den  ' -> 'cely den') - export
+    diakritiku občas ztrácí/mění kódování, viz FULL_DAY_MARKER."""
+    text = unicodedata.normalize("NFKD", str(text).strip().casefold())
+    return "".join(c for c in text if not unicodedata.combining(c))
+
 
 def load_activities(path, sheet_name=ACTIVITIES_SHEET_NAME):
     """Načte bo_data.xlsx a vybere potřebné sloupce PODLE JMÉNA hlavičky (ne podle
@@ -314,8 +324,11 @@ def load_activities(path, sheet_name=ACTIVITIES_SHEET_NAME):
     # je pak obsazené po celou otevírací dobu pobočky. Přesnou hodnotu v minutách
     # (kapacita pracoviště/den) ale známe až po spojení s work_spaces.xlsx, proto se
     # tu jen označí příznakem IS_FULL_DAY a doplní v merge_activities_with_workspaces().
+    # Porovnává se bez ohledu na velikost písmen i diakritiku (_fold_no_diacritics),
+    # aby "Celý den"/"CELÝ DEN"/"Cely den" apod. spolehlivě sedělo i při ztrátě
+    # diakritiky v exportu.
     duration_raw = df["DURATION_MIN"]
-    is_full_day = duration_raw.astype(str).str.strip().str.casefold() == "celý den"
+    is_full_day = duration_raw.map(_fold_no_diacritics) == _fold_no_diacritics(FULL_DAY_MARKER)
     df["IS_FULL_DAY"] = is_full_day
     df["DURATION_MIN"] = pd.to_numeric(duration_raw.mask(is_full_day), errors="coerce")
 
@@ -2298,7 +2311,7 @@ function goToBranch(id) {{
 # 7. Spuštění celého výpočtu a generování reportu
 # -----------------------------------------------------------------------------
 
-SCRIPT_VERSION = "2026-07-18i ('Celý den' v Trvání činnosti = celá otevírací kapacita pracoviště/den + upozornění na duplicitní 'Celý den' zápisy)"
+SCRIPT_VERSION = "2026-09-23 ('Celý den' rozpoznáno i bez diakritiky/různá velikost písmen, diagnostický výpis počtu + ověření zvednutí vytíženosti)"
 print(f"Verze skriptu: {SCRIPT_VERSION}")
 
 activities, data_issues = load_activities(BO_DATA_FILE)
@@ -2306,6 +2319,9 @@ workspaces = load_workspaces(WORKSPACES_FILE)
 segments = load_segments(SEGMENTS_FILE)
 employees = load_employees(EMPLOYEES_FILE, EMPLOYEES_SHEET_NAME)
 print(f"Aktivity: {len(activities)} platných řádků, {len(data_issues)} přeskočeno (chybná data).")
+n_full_day = int(activities["IS_FULL_DAY"].sum()) if "IS_FULL_DAY" in activities.columns else 0
+if n_full_day:
+    print(f"  z toho {n_full_day} označeno jako 'Celý den' — počítá se jako plná kapacita pracoviště/den.")
 print(f"Pobočky (work_spaces.xlsx): {len(workspaces)}")
 print(f"Segmenty pracovišť: {len(segments)} řádků")
 print(f"Zaměstnanci (list '{EMPLOYEES_SHEET_NAME}'): {len(employees)} osob")
